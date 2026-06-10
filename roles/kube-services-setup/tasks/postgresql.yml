@@ -1,0 +1,246 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create postgresql namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: postgresql
+
+################################################################################
+#  Database Credentials Secret
+################################################################################
+- name: Create PostgreSQL database credentials secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: postgresql-db-credentials
+        namespace: postgresql
+      type: Opaque
+      stringData:
+        ghostfolio_password: "{{ postgresql.ghostfolio_password }}"
+        nextcloud_password: "{{ postgresql.nextcloud_password }}"
+
+################################################################################
+#  Dedicated PVC for the pg_dumpall dump (consumed by the Velero pre-backup hook)
+#  - Velero FSB backs up only this PVC, not the live datadir
+#  - Provides a consistent SQL dump recoverable from S3
+################################################################################
+- name: Create postgresql dump PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: postgresql-dump
+        namespace: postgresql
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add bitnami Helm repo
+  kubernetes.core.helm_repository:
+    name: bitnami
+    repo_url: https://charts.bitnami.com/bitnami
+
+- name: Install postgresql via Helm
+  kubernetes.core.helm:
+    name: postgresql
+    chart_ref: bitnami/postgresql
+    namespace: postgresql
+    create_namespace: true
+    values:
+      global:
+        postgresql:
+          auth:
+            username: "{{ postgresql.username }}"
+            postgresPassword: "{{ postgresql.password }}" # Adress = postgresql.postgresql.svc.cluster.local
+      primary:
+        persistence:
+          storageClass: nfs-runtime
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1500m
+            memory: 512Mi
+        # Tuned for a small homelab: ~512 Mi pod limit, ~50 connections
+        # across all clients (nextcloud + ghostfolio + pgadmin + exporter).
+        extendedConfiguration: |
+          shared_buffers = 128MB
+          effective_cache_size = 256MB
+          work_mem = 4MB
+          maintenance_work_mem = 32MB
+          max_connections = 50
+        # Dump PVC mounted into the pod for the Velero pre-backup hook
+        extraVolumes:
+          - name: dump
+            persistentVolumeClaim:
+              claimName: postgresql-dump
+        extraVolumeMounts:
+          - name: dump
+            mountPath: /dump
+        initdb: # Init database with correct credentials
+          scripts:
+            ghostfolio.sql: |
+              CREATE DATABASE ghostfoliodb;
+              CREATE USER ghostfolio WITH ENCRYPTED PASSWORD '{{ postgresql.ghostfolio_password }}';
+              GRANT ALL PRIVILEGES ON DATABASE ghostfoliodb TO ghostfolio;
+              \connect ghostfoliodb
+              GRANT USAGE, CREATE ON SCHEMA public TO ghostfolio;
+              GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ghostfolio;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ghostfolio;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ghostfolio;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ghostfolio;
+            nextcloud.sql: |
+              CREATE DATABASE nextclouddb;
+              CREATE USER nextcloud WITH ENCRYPTED PASSWORD '{{ postgresql.nextcloud_password }}';
+              GRANT ALL PRIVILEGES ON DATABASE nextclouddb TO nextcloud;
+              \connect nextclouddb
+              GRANT USAGE, CREATE ON SCHEMA public TO nextcloud;
+              GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO nextcloud;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO nextcloud;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO nextcloud;
+              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO nextcloud;
+      metrics:
+        enabled: true
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        serviceMonitor:
+          enabled: true
+          namespace: postgresql
+          labels:
+            release: prometheus-community
+
+################################################################################
+#  Velero pre-backup annotations (post-helm patch).
+#  See the comment in the helm values block above for why these live here
+#  instead of `primary.podAnnotations`.
+################################################################################
+- name: Annotate PostgreSQL StatefulSet for Velero FSB backup
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: strategic-merge
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: postgresql
+        namespace: postgresql
+      spec:
+        template:
+          metadata:
+            annotations:
+              backup.velero.io/backup-volumes: "dump"
+              pre.hook.backup.velero.io/container: "postgresql"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'PGPASSWORD=$POSTGRES_PASSWORD pg_dumpall -U ' ~ postgresql.username ~ ' -h 127.0.0.1 > /dump/all.sql'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "10m"
+
+################################################################################
+#  NetworkPolicy
+#  PostgreSQL is ClusterIP-only. Ingress is restricted to a fixed list of
+#  application namespaces — anything else (including the tailscale namespace)
+#  is rejected. See the postgresql_client_namespaces var below.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: postgresql }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: postgresql }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: postgresql }
+
+# Application namespaces allowed to talk to PostgreSQL on 5432.
+# Add a namespace here when wiring a new app to PostgreSQL.
+- name: "[netpol/postgresql] apps ingress (port 5432)"
+  vars:
+    postgresql_client_namespaces:
+      - ghostfolio
+      - nextcloud
+      - pgadmin
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: postgresql-allow-apps-ingress
+        namespace: postgresql
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postgresql
+        policyTypes: [Ingress]
+        ingress:
+          - from: "{{ postgresql_client_namespaces | map('community.general.dict_kv', 'kubernetes.io/metadata.name') | map('community.general.dict_kv', 'matchLabels') | map('community.general.dict_kv', 'namespaceSelector') | list }}"
+            ports:
+              - { protocol: TCP, port: 5432 }
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: postgresql
+    pod_selector: { app.kubernetes.io/name: postgresql }
+    ports: [9187]
+
+- include_tasks: _netpol/kuma-probe.yml
+  vars:
+    ns: postgresql
+    pod_selector: { app.kubernetes.io/name: postgresql }
+    port: 5432
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Postgresql dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: postgresql-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        postgresql-dashboard.json: "{{ lookup('file', 'files/postgresql-dashboard.json') | string }}"
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+#  TCP probe on the cluster-internal Service.
+################################################################################
+- name: Register Kuma monitor for postgresql
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: postgresql-monitor
+        namespace: postgresql
+      spec:
+        config:
+          type: port
+          name: postgresql
+          hostname: "postgresql.postgresql.svc.cluster.local"
+          port: 5432
+          interval: 60
+          maxretries: 2

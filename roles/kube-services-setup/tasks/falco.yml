@@ -1,0 +1,153 @@
+# Deploys Falco + Falcosidekick (SMTP email)
+# Debug :
+# kubectl run shell --rm -i --tty --image=alpine -- sh
+# apk add --no-cache curl
+# curl http://1.1.1.1
+
+- name: Add Falcosecurity Helm repository
+  community.kubernetes.helm_repository:
+    name: falcosecurity
+    repo_url: https://falcosecurity.github.io/charts
+    state: present
+
+- name: Update Helm repositories
+  ansible.builtin.command: helm repo update
+  changed_when: false
+
+- name: Create Falco namespace
+  kubernetes.core.k8s:
+    name: falco
+    api_version: v1
+    kind: Namespace
+    state: present
+
+- name: Install/Upgrade Falco Helm chart
+  community.kubernetes.helm:
+    name: falco
+    chart_ref: falcosecurity/falco
+    release_namespace: falco
+    values:
+      driver:
+        # CO-RE eBPF (kernel 5.8+); avoids needing linux-headers on the host.
+        kind: modern_ebpf
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 1000m
+          memory: 512Mi
+      falco:
+        jsonOutput: true
+        jsonIncludeOutputProperty: true
+        # Native Prometheus metrics (Falco 0.36+) on the embedded webserver
+        # endpoint /metrics, port 8765 by default.
+        metrics:
+          enabled: true
+          interval: 30s
+          output_rule: true
+          rules_counters_enabled: true
+          resource_utilization_enabled: true
+          state_counters_enabled: true
+        webserver:
+          enabled: true
+      metrics:
+        enabled: true
+        service:
+          create: true
+          type: ClusterIP
+          ports:
+            metrics:
+              port: 8765
+              targetPort: 8765
+              protocol: TCP
+      # Native ServiceMonitor created by the chart and labelled so our
+      # Prometheus Operator picks it up.
+      serviceMonitor:
+        create: true
+        labels:
+          release: prometheus-community
+      falcosidekick:
+        enabled: true
+        replicaCount: 1
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        config:
+          smtp:
+            hostport: "{{ falco.smtp_hostport }}"
+            user: "{{ falco.smtp_user }}"
+            password: "{{ falco.smtp_password }}"
+            from: "{{ falco.smtp_from }}"
+            to: "{{ falco.smtp_to }}"
+            outputformat: "{{ falco.smtp_outputformat }}"
+            minimumpriority: "error"
+        serviceMonitor:
+          enabled: true
+          additionalLabels:
+            release: prometheus-community
+    state: present
+    wait: true
+    timeout: 5m
+  register: helm_result
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+#  Note: the Falco DaemonSet uses hostNetwork; NetworkPolicies do NOT apply
+#  to host-network pods. The policies below cover Falcosidekick (regular
+#  cluster-network pod) and any non-hostNetwork Falco component.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: falco }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: falco }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: falco }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: falco }
+
+# Falcosidekick -> SMTP relay (LAN blocked).
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: falco
+    pod_selector: { app.kubernetes.io/name: falcosidekick }
+    name_suffix: smtp
+    ports: [25, 465, 587, 2525]
+
+# Falco -> Internet (rule updates from falcosecurity.org, etc.).
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: falco
+    pod_selector: { app.kubernetes.io/name: falco }
+
+# Prometheus scrapes both falco (8765) and falcosidekick (2801).
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: falco
+    pod_selector: {}
+    ports: [8765, 2801]
+
+################################################################################
+#  ConfigMap (Grafana Dashboard) — community ID 11914 "Falco Dashboard"
+################################################################################
+- name: Create Falco Grafana dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: falco-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        falco-dashboard.json: "{{ lookup('file', 'files/falco-dashboard.json') | string }}"

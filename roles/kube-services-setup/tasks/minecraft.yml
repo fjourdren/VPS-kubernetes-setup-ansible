@@ -1,0 +1,316 @@
+---
+################################################################################
+#  Namespace
+################################################################################
+- name: Ensure the "minecraft" namespace exists
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "minecraft"
+
+################################################################################
+#  Secret (RCON password used by the Velero pre-backup hook)
+################################################################################
+- name: Create Minecraft secret
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: minecraft-secret
+        namespace: "minecraft"
+      type: Opaque
+      stringData:
+        RCON_PASSWORD: "{{ minecraft.rcon_password }}"
+
+################################################################################
+#  PersistentVolumeClaim
+################################################################################
+- name: Create PVC
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: minecraft-pvc
+        namespace: "minecraft"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: nfs-important-retain
+        resources:
+          requests:
+            storage: 20Gi
+
+################################################################################
+#  StatefulSet
+################################################################################
+- name: Deploy the Minecraft server (StatefulSet)
+  k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: minecraft
+        namespace: "minecraft"
+      spec:
+        replicas: 1
+        serviceName: minecraft
+        selector:
+          matchLabels:
+            app: minecraft
+        template:
+          metadata:
+            labels:
+              app: minecraft
+            # Velero FSB: backs up the world data after forcing a full save.
+            # rcon-cli reads RCON_PASSWORD/RCON_PORT from env (set below).
+            annotations:
+              backup.velero.io/backup-volumes: "data"
+              pre.hook.backup.velero.io/container: "minecraft"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'rcon-cli save-all flush'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+          spec:
+            securityContext:
+              fsGroup: 1000
+              fsGroupChangePolicy: OnRootMismatch
+            initContainers:
+              # PrometheusExporter plugin (sladkoff) auto-generates its config
+              # on first start and binds to localhost:9225, making /metrics
+              # unreachable from the cluster. Force host: 0.0.0.0 in-place so
+              # Prometheus can scrape it. Idempotent across pod restarts; the
+              # bootstrap config (if missing) seeds defaults the plugin would
+              # otherwise generate on its first run.
+              - name: prometheus-exporter-config
+                image: busybox:1.37
+                command:
+                  - sh
+                  - -c
+                  - |
+                    set -eu
+                    cfg=/data/plugins/PrometheusExporter/config.yml
+                    mkdir -p "$(dirname "$cfg")"
+                    if [ ! -f "$cfg" ]; then
+                      printf 'host: 0.0.0.0\nport: 9225\n' > "$cfg"
+                    else
+                      sed -i 's/^host:.*/host: 0.0.0.0/' "$cfg"
+                      grep -q '^host:' "$cfg" || printf 'host: 0.0.0.0\n' >> "$cfg"
+                    fi
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            containers:
+              - name: minecraft
+                image: itzg/minecraft-server:latest
+                imagePullPolicy: IfNotPresent
+                env:
+                  - name: TYPE
+                    value: PAPER
+                  - name: VERSION
+                    value: "1.21.10"
+                  - name: EULA
+                    value: "TRUE"
+                  - name: GAMEMODE
+                    value: survival
+                  - name: ENABLE_RCON
+                    value: "true"
+                  - name: RCON_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: minecraft-secret
+                        key: RCON_PASSWORD
+                  # JVM heap. Pod memory limit (5Gi) leaves ~1Gi headroom for
+                  # off-heap (metaspace, native, GC) on top of the 4G heap.
+                  - name: MEMORY
+                    value: "4G"
+                  # itzg/minecraft-server installs Spigot plugins automatically.
+                  # Spigot resource 36618 = "Prometheus Exporter" (sladkoff) which
+                  # exposes /metrics on port 9225 by default. The plugin reads its
+                  # config from /data/plugins/MinecraftPrometheusExporter/config.yml
+                  # — we let it auto-create the default config (port 9225, host 0.0.0.0).
+                  - name: SPIGET_RESOURCES
+                    value: "36618"
+                ports:
+                  - name: minecraft
+                    containerPort: 25565
+                  - name: metrics
+                    containerPort: 9225
+                resources:
+                  requests:
+                    cpu: 500m
+                    memory: 4Gi
+                  limits:
+                    cpu: 2
+                    memory: 5Gi
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: minecraft-pvc
+
+################################################################################
+#  Service
+################################################################################
+- name: Expose Minecraft via Service
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: minecraft
+        namespace: "minecraft"
+      spec:
+        selector:
+          app: minecraft
+        ports:
+          - name: minecraft
+            port: 25565
+            targetPort: 25565
+            protocol: TCP
+
+################################################################################
+#  Service (metrics — separate from the IngressRouteTCP path)
+################################################################################
+- name: Create Minecraft metrics Service
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: minecraft-metrics
+        namespace: minecraft
+        labels:
+          app: minecraft
+      spec:
+        selector:
+          app: minecraft
+        ports:
+          - name: metrics
+            port: 9225
+            targetPort: 9225
+            protocol: TCP
+
+################################################################################
+#  IngressRouteTCP
+################################################################################
+- name: Create Traefik TCP IngressRoute for Minecraft
+  k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRouteTCP
+      metadata:
+        name: minecraft-tcp
+        namespace: minecraft
+      spec:
+        entryPoints:
+          - minecraft
+        routes:
+          - match: HostSNI(`*`)
+            services:
+              - name: minecraft
+                port: 25565
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: minecraft }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: minecraft }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: minecraft
+    pod_selector: { app: minecraft }
+    port: 25565
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: minecraft
+    pod_selector: { app: minecraft }
+    ports: [9225]
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: minecraft
+    pod_selector: { app: minecraft }
+
+################################################################################
+#  ServiceMonitor (Prometheus Operator)
+#  Scrape /metrics on port 9225 exposed by the Modrinth plugin
+#  `minecraft-prometheus-exporter`.
+################################################################################
+- name: Create Minecraft ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: minecraft
+        namespace: minecraft
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: minecraft
+        namespaceSelector:
+          matchNames:
+            - minecraft
+        endpoints:
+          - port: metrics
+            interval: 30s
+
+################################################################################
+#  ConfigMap (Grafana Dashboard) — community ID 11993 "Minecraft Server"
+################################################################################
+- name: Create Minecraft Grafana dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: minecraft-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        minecraft-dashboard.json: "{{ lookup('file', 'files/minecraft-dashboard.json') | string }}"
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+#  TCP probe via the public LB (Kuma reaches it through the
+#  kuma-allow-traefik-lb-egress NetworkPolicy on port 25565).
+################################################################################
+- name: Register Kuma monitor for minecraft
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: minecraft-monitor
+        namespace: minecraft
+      spec:
+        config:
+          type: port
+          name: minecraft
+          hostname: "{{ network.public_address }}"
+          port: 25565
+          interval: 60
+          maxretries: 2

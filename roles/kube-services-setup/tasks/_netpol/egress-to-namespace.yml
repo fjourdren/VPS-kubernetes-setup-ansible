@@ -1,0 +1,37 @@
+################################################################################
+#  NetworkPolicy helper: egress from selected pods to a target namespace
+#  Required vars:
+#    ns:               source namespace (where the policy is created)
+#    name:             logical target name, used in the policy name
+#                      (e.g. "postgresql", "redis", "n8n")
+#    pod_selector:     matchLabels dict identifying the source pods
+#    target_namespace: destination namespace
+#  Optional vars (provide exactly one):
+#    port:  single TCP port at the destination
+#    ports: list of TCP ports at the destination
+#  Creates: <ns>-allow-<name>-egress
+################################################################################
+- name: "[netpol/{{ ns }}] egress -> {{ target_namespace }} ({{ ports | default([port]) | join(',') }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-allow-{{ name }}-egress"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector:
+          matchLabels: "{{ pod_selector }}"
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: "{{ target_namespace }}"
+            ports: "{{ ports | default([port]) | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

@@ -1,0 +1,30 @@
+---
+# /var/snap/microk8s/common/default-storage
+
+- name: Disable default on microk8s-hostpath
+  kubernetes.core.k8s:
+    state: patched
+    kind: StorageClass
+    api_version: storage.k8s.io/v1
+    name: microk8s-hostpath
+    definition:
+      metadata:
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+          storageclass.beta.kubernetes.io/is-default-class: "false"
+
+- name: Create hostpath-retain StorageClass
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: microk8s-hostpath-retain
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+          storageclass.beta.kubernetes.io/is-default-class: "false"
+      provisioner: microk8s.io/hostpath
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true

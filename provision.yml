@@ -1,0 +1,81 @@
+- hosts: provisionning
+  become: true
+  vars_files:
+    - secrets.yml # The secret needs to be loaded there (cannot be loaded for a specific role)
+  vars:
+    # index of the host in the group (0,1,2,…) based on inventory order
+    host_index: "{{ groups['provisionning'].index(inventory_hostname) | int }}"
+
+    # computed IP : base_ip + host_index
+    ipv4_address: "{{ network.base_ip | ansible.utils.ipmath(host_index) }}"
+
+    # Auto hostname : prefix + (index + 1)
+    hostname: "{{ network.host_hostname_prefix ~ (host_index | int + 1) }}"
+  roles:
+    - role: common
+    - role: user
+    - role: network-config
+      vars:
+        netmask: "{{ network.host_mask }}"
+        gateway: "{{ network.host_gateway }}"
+        dns_servers: ["{{ network.dns }}"]
+        domain: "{{ network.host_domain }}"
+    - role: geerlingguy.security
+      vars:
+        security_ssh_port: "{{ ssh.port }}"
+        security_ssh_password_authentication: "no"
+        security_ssh_permit_root_login: "no"
+        security_ssh_usedns: "no"
+        security_ssh_allowed_users: ["{{ user.username }}"]
+
+        # Firewall settings
+        security_enable_firewall: false
+        #security_firewall_allowed_tcp_ports:
+        #  - "{{ ssh.port }}" # SSH
+        #  - "80" # HTTP
+        #  - "443" # HTTPS
+
+        # Security autoupdate
+        security_autoupdate_enabled: true
+
+        # Autoupdate mail settings used on Debian/Ubuntu only.
+        security_autoupdate_reboot: "false"
+        security_autoupdate_mail_to: "{{ user.username }}"
+        security_autoupdate_mail_on_error: true
+
+        # fail2ban settings
+        security_fail2ban_enabled: true
+        security_fail2ban_bantime: 600
+        security_fail2ban_findtime: 600
+        security_fail2ban_maxretry: 3
+
+  post_tasks:
+    # Schedule the reboot via a transient systemd timer so the SSH session can
+    # close cleanly before shutdown begins. The reboot picks up the new netplan
+    # config (IP change) and SSH changes.
+    - name: Schedule reboot via transient systemd timer (survives SSH drop)
+      ansible.builtin.command: >-
+        systemd-run --on-active=3sec
+        --unit=ansible-provision-reboot
+        /sbin/shutdown -r now
+      changed_when: true
+
+    - name: Wait for SSH on the new IP/port (from controller)
+      ansible.builtin.wait_for:
+        host: "{{ ipv4_address }}"
+        port: "{{ ssh.port }}"
+        delay: 10
+        timeout: 240
+        state: started
+      delegate_to: localhost
+      become: false
+      register: wait_conn
+      failed_when: false
+
+    - name: Provisioning reboot result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'SSH reachable on ' ~ ipv4_address ~ ':' ~ ssh.port ~ ' after reboot.'
+             if (wait_conn.failed is not defined or not wait_conn.failed)
+             else 'Timed out waiting for SSH on ' ~ ipv4_address ~ ':' ~ ssh.port ~ '. Check the server manually (journalctl -b -u systemd-networkd; netplan get; ip -br a).' }}
+      become: false

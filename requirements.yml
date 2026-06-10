@@ -1,0 +1,17 @@
+---
+collections:
+  - name: community.docker
+    source: https://galaxy.ansible.com
+  - name: community.kubernetes
+    source: https://galaxy.ansible.com
+  - name: community.general
+    version: ">=6.0.0"
+  - name: ansible.utils
+    source: https://galaxy.ansible.com
+roles:
+  - name: geerlingguy.security
+    version: 2.4.0
+  - name: istvano.microk8s
+    src: https://github.com/istvano/ansible_role_microk8s.git
+    scm: git
+    version: master

@@ -1,0 +1,385 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create nginx namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: nginx
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy Nginx (Deployment)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx
+        namespace: nginx
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nginx
+        template:
+          metadata:
+            labels:
+              app: nginx
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:latest
+                ports:
+                  - containerPort: 80
+                volumeMounts:
+                  - name: nginx-config
+                    mountPath: /etc/nginx/conf.d/status.conf
+                    subPath: status.conf
+            volumes:
+              - name: nginx-config
+                configMap:
+                  name: nginx-status-config
+
+################################################################################
+#  ConfigMap for Nginx status endpoint
+################################################################################
+- name: Create Nginx status ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nginx-status-config
+        namespace: nginx
+      data:
+        status.conf: |
+          server {
+            listen 8080;
+            location /stub_status {
+              stub_status on;
+              access_log off;
+            }
+          }
+
+################################################################################
+#  Service
+################################################################################
+- name: Expose Nginx (Service)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nginx
+        namespace: nginx
+      spec:
+        selector:
+          app: nginx
+        ports:
+          - port: 80
+            targetPort: 80
+            protocol: TCP
+            name: http
+          - port: 8080
+            targetPort: 8080
+            protocol: TCP
+            name: metrics-status
+
+################################################################################
+#  Certificate (Cert-Manager)
+################################################################################
+- include_tasks: _cf-acme-cleanup.yml
+  vars:
+    cf_acme_namespace: nginx
+    cf_acme_secret_name: nginx-cert-prod
+    cf_acme_dns_name: "nginx.{{ network.public_domain }}"
+
+- name: Request nginx.{{ network.public_domain }} certificate
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: nginx-cert-prod
+        namespace: nginx
+      spec:
+        secretName: nginx-cert-prod
+        issuerRef:
+          name: letsencrypt-prod
+          kind: ClusterIssuer
+        dnsNames:
+          - "nginx.{{ network.public_domain }}"
+
+################################################################################
+#  IngressRoute (Traefik v2)
+################################################################################
+# Uncomment to use HTTP
+#- name: Creation of Nginx IngressRoute HTTP
+#  kubernetes.core.k8s:
+#    state: present
+#    definition:
+#      apiVersion: traefik.io/v1alpha1
+#      kind: IngressRoute
+#      metadata:
+#        name: nginx-http
+#        namespace: nginx
+#      spec:
+#        entryPoints:
+#          - web-public
+#        routes:
+#          - match: Host(`nginx.{{ network.public_domain }}`)
+#            kind: Rule
+#            middlewares:
+#              - name: public-security
+#                namespace: traefik
+#            services:
+#              - name: nginx
+#                port: 80
+
+# Uncomment to redirect HTTP to HTTPS
+- name: Creation of Nginx IngressRoute HTTP Redirect
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: nginx-http-redirect
+        namespace: nginx
+      spec:
+        entryPoints:
+          - web-public
+        routes:
+          - match: Host(`nginx.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+              - name: redirect-to-https
+                namespace: traefik
+            services:
+              - name: nginx
+                port: 80
+
+- name: Creation of Nginx IngressRoute HTTPS
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: nginx-https
+        namespace: nginx
+      spec:
+        entryPoints:
+          - websecure-public
+        routes:
+          - match: Host(`nginx.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+            services:
+              - name: nginx
+                port: 80
+        tls:
+          secretName: nginx-cert-prod
+
+################################################################################
+#  Nginx Prometheus Exporter Deployment
+################################################################################
+- name: Deploy Nginx Prometheus Exporter
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nginx-exporter
+        namespace: nginx
+        labels:
+          app: nginx-exporter
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nginx-exporter
+        template:
+          metadata:
+            labels:
+              app: nginx-exporter
+          spec:
+            containers:
+              - name: nginx-exporter
+                image: nginx/nginx-prometheus-exporter:latest
+                args:
+                  - -nginx.scrape-uri=http://nginx:8080/stub_status
+                ports:
+                  - containerPort: 9113
+                    name: metrics
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 64Mi
+                  limits:
+                    cpu: 200m
+                    memory: 128Mi
+
+################################################################################
+#  Nginx Exporter Service
+################################################################################
+- name: Create Nginx Exporter Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nginx-exporter
+        namespace: nginx
+        labels:
+          app: nginx-exporter
+      spec:
+        selector:
+          app: nginx-exporter
+        ports:
+          - port: 9113
+            targetPort: 9113
+            protocol: TCP
+            name: metrics
+
+################################################################################
+#  ServiceMonitor for Nginx
+################################################################################
+- name: Create Nginx ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: nginx
+        namespace: nginx
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: nginx-exporter
+        namespaceSelector:
+          matchNames:
+            - nginx
+        endpoints:
+          - port: metrics
+            interval: 30s
+
+################################################################################
+#  ConfigMap (Grafana Dashboard) — community ID 12708 "NGINX exporter"
+################################################################################
+- name: Create Nginx Grafana dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nginx-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        nginx-dashboard.json: "{{ lookup('file', 'files/nginx-dashboard.json') | string }}"
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: nginx }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: nginx }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: nginx
+    pod_selector: { app: nginx }
+    port: 80
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: nginx
+    pod_selector: { app: nginx-exporter }
+    ports: [9113]
+    name_suffix: exporter-prometheus-scrape
+
+# nginx-exporter -> nginx pod (for the stub_status endpoint).
+- name: "[netpol/nginx] exporter -> nginx egress (port 8080)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: nginx-allow-exporter-egress
+        namespace: nginx
+      spec:
+        podSelector:
+          matchLabels:
+            app: nginx-exporter
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - podSelector:
+                  matchLabels:
+                    app: nginx
+            ports:
+              - { protocol: TCP, port: 8080 }
+
+- name: "[netpol/nginx] exporter -> nginx ingress (port 8080)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: nginx-allow-exporter-ingress
+        namespace: nginx
+      spec:
+        podSelector:
+          matchLabels:
+            app: nginx
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app: nginx-exporter
+            ports:
+              - { protocol: TCP, port: 8080 }
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for nginx
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: nginx-monitor
+        namespace: nginx
+      spec:
+        config:
+          type: http
+          name: nginx
+          url: "https://nginx.{{ network.public_domain }}"
+          interval: 60
+          maxretries: 2

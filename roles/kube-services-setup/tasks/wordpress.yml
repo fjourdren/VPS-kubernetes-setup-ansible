@@ -1,0 +1,470 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create wordpress namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: wordpress
+
+################################################################################
+#  Secret (database + wp-admin credentials)
+################################################################################
+- name: Create wordpress secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: wordpress-db-secret
+        namespace: wordpress
+      type: Opaque
+      stringData:
+        # MySQL
+        WORDPRESS_DB_USER: "wordpress"
+        WORDPRESS_DB_PASSWORD: "{{ wordpress.db_password }}"
+        WORDPRESS_DB_NAME: "wordpressdb"
+        # WordPress admin
+        WORDPRESS_USERNAME: "{{ wordpress.username }}"
+        WORDPRESS_PASSWORD: "{{ wordpress.password }}"
+        WORDPRESS_EMAIL: "{{ wordpress.email }}"
+
+################################################################################
+#  PersistentVolumeClaim - MySQL
+################################################################################
+- name: Create mysql PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: mysql-pvc
+        namespace: wordpress
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Dedicated PVC for the mysqldump (consumed by the Velero pre-backup hook)
+#  - Velero FSB backs up only this PVC, not the live datadir
+################################################################################
+- name: Create mysql dump PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: mysql-dump
+        namespace: wordpress
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment - MySQL
+################################################################################
+- name: Create mysql deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mysql
+        namespace: wordpress
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: mysql
+        template:
+          metadata:
+            labels:
+              app: mysql
+            # Velero annotations: pre-hook = mysqldump to /dump/wordpress.sql.
+            # FSB backs up only the "dump" volume (not the live datadir).
+            annotations:
+              backup.velero.io/backup-volumes: "dump"
+              pre.hook.backup.velero.io/container: "mysql"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'mysqldump -h 127.0.0.1 -u \"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\" --single-transaction --routines --triggers \"$MYSQL_DATABASE\" > /dump/wordpress.sql'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "10m"
+          spec:
+            containers:
+              - name: mysql
+                image: mysql:8.0
+                args:
+                  - "--default-authentication-plugin=mysql_native_password"
+                env:
+                  - name: MYSQL_DATABASE
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_NAME
+                  - name: MYSQL_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_USER
+                  - name: MYSQL_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_PASSWORD
+                  - name: MYSQL_RANDOM_ROOT_PASSWORD
+                    value: "yes"
+                volumeMounts:
+                  - name: mysql-storage
+                    mountPath: /var/lib/mysql
+                  - name: dump
+                    mountPath: /dump
+            volumes:
+              - name: mysql-storage
+                persistentVolumeClaim:
+                  claimName: mysql-pvc
+              - name: dump
+                persistentVolumeClaim:
+                  claimName: mysql-dump
+
+################################################################################
+#  Service - MySQL
+################################################################################
+- name: Create mysql service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: mysql
+        namespace: wordpress
+      spec:
+        ports:
+          - port: 3306
+        selector:
+          app: mysql
+
+################################################################################
+#  PersistentVolumeClaim - WordPress
+################################################################################
+- name: Create wordpress PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: wordpress-pvc
+        namespace: wordpress
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment - WordPress
+################################################################################
+- name: Create wordpress Deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: wordpress
+        namespace: wordpress
+        labels:
+          app: wordpress
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: wordpress
+        template:
+          metadata:
+            labels:
+              app: wordpress
+            # Velero FSB: backs up the wordpress PVC (themes, plugins, uploads).
+            # The MySQL data is captured via mysqldump on the mysql Deployment.
+            annotations:
+              backup.velero.io/backup-volumes: "wordpress-storage"
+          spec:
+            securityContext:
+              fsGroup: 1001 # Needed for file writing
+            initContainers:
+              - name: wait-for-mysql
+                image: mysql:8
+                command: ['sh', '-c', 'until mysqladmin ping -h mysql --silent; do echo waiting for mysql; sleep 5; done']
+            containers:
+              - name: wordpress
+                image: bitnami/wordpress:latest
+                ports:
+                  - containerPort: 8080  # Bitnami WordPress écoute sur 8080
+                env:
+                  # DB
+                  - name: WORDPRESS_DATABASE_HOST
+                    value: mysql
+                  - name: WORDPRESS_DATABASE_PORT_NUMBER
+                    value: "3306"
+                  - name: WORDPRESS_DATABASE_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_USER
+                  - name: WORDPRESS_DATABASE_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_PASSWORD
+                  - name: WORDPRESS_DATABASE_NAME
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_DB_NAME
+                  - name: WORDPRESS_USERNAME
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_USERNAME
+                  - name: WORDPRESS_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_PASSWORD
+                  - name: WORDPRESS_EMAIL
+                    valueFrom:
+                      secretKeyRef:
+                        name: wordpress-db-secret
+                        key: WORDPRESS_EMAIL
+                  - name: WORDPRESS_BLOG_NAME
+                    value: "My WordPress Blog"
+                volumeMounts:
+                  - name: wordpress-storage
+                    mountPath: /bitnami/wordpress
+            volumes:
+              - name: wordpress-storage
+                persistentVolumeClaim:
+                  claimName: wordpress-pvc
+
+################################################################################
+#  Service - WordPress
+################################################################################
+- name: Create wordpress service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: wordpress
+        namespace: wordpress
+      spec:
+        selector:
+          app: wordpress
+        ports:
+          - port: 80
+            targetPort: 8080
+
+################################################################################
+#  Certificate (Cert-Manager)
+################################################################################
+- include_tasks: _cf-acme-cleanup.yml
+  vars:
+    cf_acme_namespace: wordpress
+    cf_acme_secret_name: wordpress-cert-prod
+    cf_acme_dns_name: "wordpress.{{ network.public_domain }}"
+
+- name: Request wordpress.{{ network.public_domain }} certificate
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: wordpress-cert-prod
+        namespace: wordpress
+      spec:
+        secretName: wordpress-cert-prod
+        issuerRef:
+          name: letsencrypt-prod
+          kind: ClusterIssuer
+        dnsNames:
+          - "wordpress.{{ network.public_domain }}"
+
+################################################################################
+#  IngressRoute - Traefik v2
+################################################################################
+# Uncomment to use HTTP
+#- name: Create wordpress IngressRoute HTTP
+#  kubernetes.core.k8s:
+#    state: present
+#    definition:
+#      apiVersion: traefik.io/v1alpha1
+#      kind: IngressRoute
+#      metadata:
+#        name: wordpress-http
+#        namespace: wordpress
+#      spec:
+#        entryPoints:
+#          - web-public
+#        routes:
+#          - match: Host(`wordpress.{{ network.public_domain }}`)
+#            kind: Rule
+#            middlewares:
+#              - name: public-security
+#                namespace: traefik
+#            services:
+#              - name: wordpress
+#                port: 80
+
+# Uncomment to redirect HTTP to HTTPS
+- name: Create wordpress IngressRoute HTTP Redirect
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: wordpress-http-redirect
+        namespace: wordpress
+      spec:
+        entryPoints:
+          - web-public
+        routes:
+          - match: Host(`wordpress.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+              - name: redirect-to-https
+                namespace: traefik
+            services:
+              - name: wordpress
+                port: 80
+
+- name: Create wordpress IngressRoute HTTPS
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: wordpress-https
+        namespace: wordpress
+      spec:
+        entryPoints:
+          - websecure-public
+        routes:
+          - match: Host(`wordpress.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+            services:
+              - name: wordpress
+                port: 80
+        tls:
+          secretName: wordpress-cert-prod
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: wordpress }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: wordpress }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: wordpress
+    pod_selector: { app: wordpress }
+    port: 8080
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: wordpress
+    pod_selector: { app: wordpress }
+
+# wordpress <-> mysql (same namespace, pod-to-pod).
+- name: "[netpol/wordpress] wordpress -> mysql egress (port 3306)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: wordpress-allow-mysql-egress
+        namespace: wordpress
+      spec:
+        podSelector:
+          matchLabels:
+            app: wordpress
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - podSelector:
+                  matchLabels:
+                    app: mysql
+            ports:
+              - { protocol: TCP, port: 3306 }
+
+- name: "[netpol/wordpress] mysql ingress from wordpress (port 3306)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: wordpress-mysql-allow-wordpress-ingress
+        namespace: wordpress
+      spec:
+        podSelector:
+          matchLabels:
+            app: mysql
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app: wordpress
+            ports:
+              - { protocol: TCP, port: 3306 }
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for wordpress
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: wordpress-monitor
+        namespace: wordpress
+      spec:
+        config:
+          type: http
+          name: wordpress
+          url: "https://wordpress.{{ network.public_domain }}"
+          interval: 60
+          maxretries: 2

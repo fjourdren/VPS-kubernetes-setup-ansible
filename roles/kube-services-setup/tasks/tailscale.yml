@@ -1,0 +1,152 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create Tailscale namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: tailscale
+
+################################################################################
+#  Helm Repository & Operator install
+################################################################################
+- name: Add Tailscale Helm repository
+  kubernetes.core.helm_repository:
+    name: tailscale
+    repo_url: https://pkgs.tailscale.com/helmcharts
+
+- name: Install / upgrade Tailscale Operator via Helm
+  kubernetes.core.helm:
+    name: tailscale-operator
+    chart_ref: tailscale/tailscale-operator
+    release_namespace: tailscale
+    create_namespace: true
+    update_repo_cache: true
+    state: present
+    values:
+      oauth:
+        clientId: "{{ tailscale.oauth_client_id }}"
+        clientSecret: "{{ tailscale.oauth_client_secret }}"
+      apiServerProxyConfig:
+        # "true" => HTTPS proxy of the kube-apiserver exposed to the tailnet
+        # so tailnet members can run kubectl against the cluster (RBAC-mapped
+        # to their tailnet identity). Set to "false" to disable.
+        mode: "true"
+      # operatorConfig.defaultTags defaults to ["tag:k8s-operator"]
+      # proxyConfig.defaultTags    defaults to "tag:k8s"
+      # Both ACL tags must be declared as tagOwners in the Tailscale ACL,
+      # and the OAuth client must own tag:k8s-operator.
+
+################################################################################
+#  Wait for Connector CRD to be registered by the operator
+################################################################################
+- name: Wait for Tailscale Connector CRD to be available
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: connectors.tailscale.com
+  register: ts_connector_crd
+  retries: 30
+  delay: 5
+  until: ts_connector_crd.resources | length > 0
+
+################################################################################
+#  Subnet router Connector (LAN + cluster CIDRs)
+################################################################################
+- name: Create Tailscale subnet router Connector
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: tailscale.com/v1alpha1
+      kind: Connector
+      metadata:
+        name: vps-subnet-router
+      spec:
+        hostname: "{{ tailscale.hostname | default('vps-subnet-router') }}"
+        # spec.tags omitted on purpose: proxyConfig.defaultTags ("tag:k8s")
+        # is applied automatically and matches the ACL tagOwners config.
+        subnetRouter:
+          advertiseRoutes: "{{ tailscale.advertise_routes }}"
+        # exitNode left unset (=> false): no exit node.
+        # Routes appear "pending" in the admin console until manually
+        # approved (admin -> Machines -> vps-subnet-router -> Edit route settings).
+
+################################################################################
+#  NetworkPolicy
+#  Covers both the operator pod and the child StatefulSets dynamically
+#  created by the operator (ts-vps-subnet-router-xxxx, plus any future
+#  proxy pod for apiServerProxy / Service / Ingress proxying).
+#  All policies use podSelector: {} so they match every pod in the
+#  namespace, current and future.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: tailscale }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: tailscale }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: tailscale }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: tailscale }
+
+- include_tasks: _netpol/node-ingress.yml
+  vars: { ns: tailscale }
+
+# Tailscale daemon -> public Internet:
+#   - TCP/443 to controlplane.tailscale.com + DERP relays (HTTPS fallback,
+#     also the only path when UDP is blocked)
+#   - UDP all ports to peers/DERP for WireGuard P2P + STUN/3478 hole punching
+# LAN is excluded on purpose: subnet routing to LAN is handled by
+# tailscale-allow-subnet-routes-egress so "Internet" and "advertised routes"
+# stay separate.
+- name: "[netpol/tailscale] tailnet egress (control plane / DERP / WireGuard)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: tailscale-allow-tailnet-egress
+        namespace: tailscale
+      spec:
+        podSelector: {}
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+            ports:
+              - { protocol: TCP, port: 443 }
+              - { protocol: UDP }
+          - to:
+              - ipBlock:
+                  cidr: "::/0"
+            ports:
+              - { protocol: TCP, port: 443 }
+              - { protocol: UDP }
+
+# Subnet router forwarding: the whole point of the connector is to forward
+# tailnet traffic to the advertised routes (LAN + MicroK8s pod/service CIDRs).
+# Any TCP/UDP port must be reachable on those CIDRs.
+- name: "[netpol/tailscale] subnet-route egress (advertised CIDRs)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: tailscale-allow-subnet-routes-egress
+        namespace: tailscale
+      spec:
+        podSelector: {}
+        policyTypes: [Egress]
+        egress:
+          - to: "{{ tailscale.advertise_routes | map('community.general.dict_kv', 'cidr') | map('community.general.dict_kv', 'ipBlock') | list }}"

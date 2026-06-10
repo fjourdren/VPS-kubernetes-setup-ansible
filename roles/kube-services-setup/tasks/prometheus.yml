@@ -1,0 +1,301 @@
+# Default username: admin
+
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add Prometheus Community Helm repo
+  kubernetes.core.helm_repository:
+    name: prometheus-community
+    repo_url: https://prometheus-community.github.io/helm-charts
+
+- name: Install Prometheus Operator (kube-prometheus-stack)
+  kubernetes.core.helm:
+    name: prometheus-community
+    namespace: monitoring
+    create_namespace: true
+    chart_ref: prometheus-community/kube-prometheus-stack
+    values:
+      grafana:
+        enabled: true
+        ingress:
+          enabled: false  # Disabled - using IngressRoute instead for explicit entrypoint control
+        resources:
+          requests:
+            cpu: 50m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 768Mi
+        # Loki is the default datasource (provisioned by loki.yml via a
+        # labeled ConfigMap). Prometheus is provisioned below as a non-default
+        # datasource via the prometheus-datasource ConfigMap so the sidecar
+        # picks it up. The chart's auto-provisioned Prometheus/Alertmanager
+        # datasources are disabled (defaultDatasourceEnabled: false,
+        # alertmanager.enabled: false) to avoid duplicates with conflicting
+        # defaults.
+        sidecar:
+          skipTlsVerify: true  # Skip SSL verification for Kubernetes API (bugged with microk8s)
+          resources:
+            requests:
+              cpu: 20m
+              memory: 96Mi
+            limits:
+              cpu: 100m
+              memory: 192Mi
+          datasources:
+            enabled: true
+            label: grafana_datasource
+            searchNamespace: ALL
+            defaultDatasourceEnabled: false
+            createPrometheusReplicasDatasources: false
+            alertmanager:
+              enabled: false
+          dashboards:
+            enabled: true
+            searchNamespace: ALL # ALL
+            label: grafana_dashboard
+            provider:
+              allowUiUpdates: true
+      prometheus:
+        ingress:
+          enabled: false  # Disabled - using IngressRoute instead for explicit entrypoint control
+        prometheusSpec:
+          retention: 7d
+          retentionSize: "8GB"
+          walCompression: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1500m
+              memory: 1Gi
+          podMonitorNamespaceSelector:
+            any: true
+          podMonitorSelector: {}
+          podMonitorSelectorNilUsesHelmValues: false
+          ruleNamespaceSelector:
+            any: true
+          ruleSelector: {}
+          ruleSelectorNilUsesHelmValues: false
+          serviceMonitorNamespaceSelector:
+            any: true
+          serviceMonitorSelector: {}
+          serviceMonitorSelectorNilUsesHelmValues: false
+      alertmanager:
+        ingress:
+          enabled: false  # Disabled - using IngressRoute instead for explicit entrypoint control
+        alertmanagerSpec:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      prometheusOperator:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      # Disable scrape jobs that microk8s doesn't expose meaningfully — they
+      # produce constant scrape errors and burn memory on idle target loops.
+      kubeControllerManager:
+        enabled: false
+      kubeScheduler:
+        enabled: false
+      kubeProxy:
+        enabled: false
+      kubeEtcd:
+        enabled: false
+      nodeExporter:
+        enabled: true
+      prometheus-node-exporter:
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      kube-state-metrics:
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+            ephemeral-storage: "50Mi"
+          limits:
+            cpu: 100m
+            memory: 128Mi
+            ephemeral-storage: "200Mi"
+
+################################################################################
+#  Wait for CRDs to be ready
+################################################################################
+- name: Wait for ServiceMonitor CRD to be available
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: servicemonitors.monitoring.coreos.com
+  register: servicemonitor_crd
+  until: servicemonitor_crd.resources | length > 0
+  retries: 30
+  delay: 10
+
+################################################################################
+#  Grafana datasource — Prometheus (picked up by the Grafana sidecar via the
+#  `grafana_datasource: "1"` label). Created here (not via the chart's built-in
+#  provisioning) so we can keep it non-default — Loki is the default DS.
+################################################################################
+- name: Create Prometheus Grafana datasource
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: prometheus-datasource
+        namespace: monitoring
+        labels:
+          grafana_datasource: "1"
+      data:
+        prometheus-datasource.yaml: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              uid: prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus-community-kube-prometheus.monitoring.svc.cluster.local:9090
+              isDefault: false
+              editable: true
+
+################################################################################
+#  ServiceMonitor (Prometheus Operator)
+################################################################################
+# ServiceMonitor for Prometheus self-monitoring
+- name: Create Prometheus ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: prometheus-self
+        namespace: monitoring
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: kube-prometheus-stack-prometheus
+            release: prometheus-community
+        namespaceSelector:
+          matchNames:
+            - monitoring
+        endpoints:
+          - port: http-web
+            interval: 30s
+            path: /metrics
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: monitoring }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: monitoring }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: monitoring }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: monitoring }
+
+# Prometheus needs egress to *every* in-cluster namespace so it can scrape
+# the ServiceMonitor targets. We do NOT pin a port list here — every scrape
+# target already has its own per-namespace ingress policy that gates access
+# from the monitoring namespace, so this rule is the sane gate. The LAN
+# block from block-local-access.yml still applies on top.
+- name: "[netpol/monitoring] Prometheus scrape egress to all in-cluster namespaces"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: monitoring-allow-scraping-egress
+        namespace: monitoring
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - namespaceSelector: {}
+
+# Prometheus also needs to reach node-level metric endpoints exposed on the
+# host network (node-exporter on 9100, kubelet on 10250). These live on the
+# node LAN IP, which block-local-access.yml denies for every namespace, so
+# we punch a targeted hole per node IP discovered from the inventory.
+- name: Build node IP egress list for Prometheus
+  set_fact:
+    _monitoring_node_egress: >-
+      {{ groups['microk8s_HA']
+         | map('extract', hostvars, 'ansible_host')
+         | map('regex_replace', '^(.+)$', '{"ipBlock":{"cidr":"\1/32"}}')
+         | map('from_json')
+         | list }}
+
+- name: "[netpol/monitoring] Prometheus scrape egress to node IPs (kubelet, node-exporter)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: monitoring-allow-node-scrape-egress
+        namespace: monitoring
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
+        policyTypes: [Egress]
+        egress:
+          - to: "{{ _monitoring_node_egress }}"
+            ports:
+              - { protocol: TCP, port: 9100 }
+              - { protocol: TCP, port: 10250 }
+
+# Traefik -> Grafana (3000), Prometheus (9090), Alertmanager (9093).
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: monitoring
+    pod_selector:
+      app.kubernetes.io/name: grafana
+      app.kubernetes.io/instance: prometheus-community
+    port: 3000
+    name_suffix: grafana-traefik
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: monitoring
+    pod_selector:
+      app.kubernetes.io/name: prometheus
+    port: 9090
+    name_suffix: prometheus-traefik
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: monitoring
+    pod_selector:
+      app.kubernetes.io/name: alertmanager
+    port: 9093
+    name_suffix: alertmanager-traefik

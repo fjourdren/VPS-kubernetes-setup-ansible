@@ -1,0 +1,342 @@
+################################################################################
+#  qBittorrent
+#
+#  BitTorrent client paired with Jellyfin (jellyfin.yml). Shares the
+#  `media-library` PVC: qBittorrent mounts it at /downloads, Jellyfin mounts
+#  the same volume at /media. Categories `movies` and `tv` save to
+#  /downloads/movies and /downloads/tv, which Jellyfin sees as
+#  /media/movies and /media/tv.
+#
+#  Seeding is hard-disabled: max ratio = 0 with `Pause` action (torrents
+#  pause the instant they finish), upload speed cap of 1 KB/s, and
+#  DHT/PEX/LSD all off — outbound peer-discovery surface reduced as much as
+#  the protocol allows. The init container pre-seeds qBittorrent.conf and
+#  categories.json on first start ONLY (subsequent edits via WebUI persist).
+#
+#  First login: WebUI is at https://qbittorrent.{{ network.private_domain }}
+#  with username `admin`. The temporary password is printed in the pod logs:
+#    kubectl logs -n media -l app=qbittorrent | grep -i "temporary password"
+#  Reset it via Tools -> Options -> WebUI on first login.
+################################################################################
+
+################################################################################
+#  Namespace and shared media-library PVC (idempotent — also created by
+#  jellyfin.yml; this lets qbittorrent.yml stand alone if jellyfin is off).
+################################################################################
+- name: Create media namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: media
+
+- name: Create shared media-library PVC (RWX)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: media-library
+        namespace: media
+      spec:
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 200Gi
+        storageClassName: nfs-retain
+
+################################################################################
+#  qBittorrent config PVC (small, backed up: settings + .torrent + resume data)
+################################################################################
+- name: Create qBittorrent config PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: qbittorrent-config
+        namespace: media
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  ConfigMap holding the strict no-seed defaults (copied to /config by the
+#  init container on first start only — subsequent edits via WebUI win).
+#
+#  MaxRatioAction values: 0=Pause, 1=Remove, 2=DeleteFiles, 3=SuperSeeding.
+#  GlobalMaxRatio=0 with action=Pause -> torrent pauses the moment it
+#  finishes downloading (uploaded ratio is 0 -> at-or-above limit -> action).
+################################################################################
+- name: Create qBittorrent default-config ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: qbittorrent-default-config
+        namespace: media
+      data:
+        qBittorrent.conf: |
+          [BitTorrent]
+          Session\AnonymousModeEnabled=false
+          Session\DefaultSavePath=/downloads/complete/
+          Session\DHTEnabled=false
+          Session\Encryption=1
+          Session\GlobalMaxRatio=0
+          Session\GlobalMaxSeedingMinutes=0
+          Session\GlobalUPSpeedLimit=1024
+          Session\LSDEnabled=false
+          Session\MaxRatioAction=0
+          Session\PeXEnabled=false
+          Session\Port=6881
+          Session\TempPath=/downloads/incomplete/
+          Session\TempPathEnabled=true
+
+          [Preferences]
+          General\Locale=fr
+          WebUI\Address=0.0.0.0
+          WebUI\AlternativeUIEnabled=false
+          WebUI\AuthSubnetWhitelistEnabled=false
+          WebUI\CSRFProtection=false
+          WebUI\HostHeaderValidation=false
+          WebUI\Port=8080
+        categories.json: |
+          {
+            "movies": { "save_path": "/downloads/movies/" },
+            "tv":     { "save_path": "/downloads/tv/" }
+          }
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy qBittorrent
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: qbittorrent
+        namespace: media
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: qbittorrent
+        template:
+          metadata:
+            labels:
+              app: qbittorrent
+            annotations:
+              # Velero FSB: settings + resume data (.torrent files, fastresume).
+              # No DB hook needed — qBittorrent persists state on shutdown
+              # and FSB takes a consistent FS snapshot.
+              backup.velero.io/backup-volumes: "config"
+          spec:
+            securityContext:
+              fsGroup: 1000
+            initContainers:
+              # Seed strict no-seed defaults on the FIRST start. If the user
+              # has already started qBittorrent and a real config exists,
+              # we leave it alone (settings persist across restarts).
+              - name: seed-config
+                image: busybox:1.36
+                command: ["sh", "-c"]
+                args:
+                  - |
+                    set -e
+                    mkdir -p /config/qBittorrent
+                    if [ ! -f /config/qBittorrent/qBittorrent.conf ]; then
+                      cp /seed/qBittorrent.conf /config/qBittorrent/qBittorrent.conf
+                    fi
+                    if [ ! -f /config/qBittorrent/categories.json ]; then
+                      cp /seed/categories.json /config/qBittorrent/categories.json
+                    fi
+                    chown -R 1000:1000 /config
+                volumeMounts:
+                  - name: config
+                    mountPath: /config
+                  - name: seed
+                    mountPath: /seed
+            containers:
+              - name: qbittorrent
+                image: linuxserver/qbittorrent:5.2.0
+                env:
+                  - name: PUID
+                    value: "1000"
+                  - name: PGID
+                    value: "1000"
+                  - name: TZ
+                    value: "Europe/Paris"
+                  - name: WEBUI_PORT
+                    value: "8080"
+                ports:
+                  - containerPort: 8080
+                    name: webui
+                  - containerPort: 6881
+                    name: bt-tcp
+                    protocol: TCP
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                  limits:
+                    cpu: 2
+                    memory: 1Gi
+                volumeMounts:
+                  - name: config
+                    mountPath: /config
+                  - name: downloads
+                    mountPath: /downloads
+                # qBittorrent-nox can take several minutes to bind 8080 on first start
+                startupProbe:
+                  tcpSocket:
+                    port: 8080
+                  periodSeconds: 10
+                  failureThreshold: 30
+                readinessProbe:
+                  tcpSocket:
+                    port: 8080
+                  periodSeconds: 10
+                livenessProbe:
+                  tcpSocket:
+                    port: 8080
+                  periodSeconds: 30
+                  failureThreshold: 5
+            volumes:
+              - name: config
+                persistentVolumeClaim:
+                  claimName: qbittorrent-config
+              - name: downloads
+                persistentVolumeClaim:
+                  claimName: media-library
+              - name: seed
+                configMap:
+                  name: qbittorrent-default-config
+
+################################################################################
+#  Service
+################################################################################
+- name: Expose qBittorrent WebUI via ClusterIP Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: qbittorrent
+        namespace: media
+      spec:
+        type: ClusterIP
+        selector:
+          app: qbittorrent
+        ports:
+          - name: webui
+            port: 8080
+            targetPort: 8080
+            protocol: TCP
+
+################################################################################
+#  IngressRoute (Traefik v2, private only)
+################################################################################
+- name: Create qBittorrent IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: qbittorrent
+        namespace: media
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        middlewares:
+          - name: whitelist-local
+            namespace: traefik
+        routes:
+          - match: "Host(`qbittorrent.{{ network.private_domain }}`)"
+            kind: Rule
+            services:
+              - name: qbittorrent
+                port: 8080
+
+################################################################################
+#  NetworkPolicy
+#  Note: default-deny + dns-egress are already created by jellyfin.yml at
+#  the namespace level (idempotent); the helpers below are no-ops or extend
+#  with the qbittorrent-specific selectors.
+#
+#  qBittorrent egress is broader than the standard web-egress helper allows
+#  (BitTorrent peers/trackers can listen on any port), so we write a
+#  custom unrestricted-port egress rule that still excludes the LAN CIDR
+#  (matching the convention from web-egress.yml).
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: media }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: media }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: media
+    pod_selector: { app: qbittorrent }
+    port: 8080
+    name_suffix: qbittorrent-traefik
+
+- name: "[netpol/media] qbittorrent Internet egress, all ports (LAN blocked)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: media-allow-qbittorrent-internet-egress
+        namespace: media
+      spec:
+        podSelector:
+          matchLabels:
+            app: qbittorrent
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+          - to:
+              - ipBlock:
+                  cidr: ::/0
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for qbittorrent
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: qbittorrent-monitor
+        namespace: media
+      spec:
+        config:
+          type: http
+          name: qbittorrent
+          url: "http://qbittorrent.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

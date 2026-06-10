@@ -1,0 +1,397 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create nextcloud namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: nextcloud
+
+################################################################################
+#  Database Secret
+################################################################################
+- name: Create Nextcloud database secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nextcloud-db-secret
+        namespace: nextcloud
+      type: Opaque
+      stringData:
+        database_password: "{{ postgresql.nextcloud_password }}"
+
+################################################################################
+#  PersistentVolumeClaim
+################################################################################
+- name: Create a single PVC for Nextcloud
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: nextcloud-data
+        namespace: nextcloud
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 20Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy Nextcloud Deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nextcloud
+        namespace: nextcloud
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: nextcloud
+        template:
+          metadata:
+            labels:
+              app: nextcloud
+            # Velero FSB: backs up the nextcloud-data PVC (config + apps + user data).
+            # Nextcloud database lives in the postgresql namespace and is captured
+            # by its own pg_dumpall hook. Maintenance mode is toggled around the
+            # backup for consistency. `|| true` keeps the hook idempotent on first
+            # boot, before config/config.php is initialised.
+            annotations:
+              backup.velero.io/backup-volumes: "nextcloud-data"
+              pre.hook.backup.velero.io/container: "nextcloud"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'su www-data -s /bin/sh -c \"php /var/www/html/occ maintenance:mode --on\" || true'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+              post.hook.backup.velero.io/container: "nextcloud"
+              post.hook.backup.velero.io/command: '["/bin/sh","-c","su www-data -s /bin/sh -c \"php /var/www/html/occ maintenance:mode --off\" || true"]'
+              post.hook.backup.velero.io/timeout: "5m"
+          spec:
+            containers:
+              - name: nextcloud
+                image: nextcloud
+                ports:
+                  - containerPort: 80
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                volumeMounts:
+                  - name: nextcloud-data
+                    mountPath: /var/www/html
+                    subPath: html
+                env:
+                  - name: NEXTCLOUD_TRUSTED_DOMAINS
+                    # Public domain + in-cluster service name (the latter so
+                    # the nextcloud-exporter can call the serverinfo API
+                    # without tripping the trusted_domains gate).
+                    value: nextcloud.{{ network.private_domain }} nextcloud.nextcloud.svc.cluster.local
+                  - name: POSTGRES_DB
+                    value: nextclouddb
+                  - name: POSTGRES_USER
+                    value: nextcloud
+                  - name: POSTGRES_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: nextcloud-db-secret
+                        key: database_password
+                  - name: POSTGRES_HOST
+                    value: postgresql.postgresql.svc.cluster.local
+                  - name: NEXTCLOUD_ADMIN_USER
+                    value: "{{ nextcloud.username }}"
+                  - name: NEXTCLOUD_ADMIN_PASSWORD
+                    value: "{{ nextcloud.password }}"
+            volumes:
+              - name: nextcloud-data
+                persistentVolumeClaim:
+                  claimName: nextcloud-data
+
+################################################################################
+#  Service
+################################################################################
+- name: Create Nextcloud Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nextcloud
+        namespace: nextcloud
+      spec:
+        selector:
+          app: nextcloud
+        ports:
+          - port: 80
+            targetPort: 80
+            protocol: TCP
+
+################################################################################
+#  IngressRoute (Traefik v2)
+################################################################################
+- name: Create Nextcloud IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: nextcloud
+        namespace: nextcloud
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        middlewares:
+          - name: whitelist-local
+            namespace: traefik
+        routes:
+          - match: Host(`nextcloud.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: nextcloud
+                port: 80
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: nextcloud }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: nextcloud }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: nextcloud
+    pod_selector: { app: nextcloud }
+    port: 80
+
+- include_tasks: _netpol/egress-to-namespace.yml
+  vars:
+    ns: nextcloud
+    name: postgresql
+    pod_selector: { app: nextcloud }
+    target_namespace: postgresql
+    port: 5432
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: nextcloud
+    pod_selector: { app: nextcloud }
+
+################################################################################
+#  Nextcloud Prometheus Exporter
+#  https://github.com/xperimental/nextcloud-exporter — scrapes Nextcloud's
+#  built-in serverinfo API (admin auth required) and exposes /metrics on :9205.
+################################################################################
+- name: Create nextcloud-exporter credentials Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: nextcloud-exporter-auth
+        namespace: nextcloud
+      type: Opaque
+      stringData:
+        # Admin credentials used by the exporter to call the serverinfo API.
+        NEXTCLOUD_USERNAME: "{{ nextcloud.username }}"
+        NEXTCLOUD_PASSWORD: "{{ nextcloud.password }}"
+
+- name: Deploy Nextcloud Prometheus Exporter
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: nextcloud-exporter
+        namespace: nextcloud
+        labels:
+          app: nextcloud-exporter
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: nextcloud-exporter
+        template:
+          metadata:
+            labels:
+              app: nextcloud-exporter
+          spec:
+            containers:
+              - name: exporter
+                image: ghcr.io/xperimental/nextcloud-exporter:0.9.1
+                env:
+                  - name: NEXTCLOUD_SERVER
+                    value: "http://nextcloud.nextcloud.svc.cluster.local"
+                envFrom:
+                  - secretRef:
+                      name: nextcloud-exporter-auth
+                ports:
+                  - name: metrics
+                    containerPort: 9205
+                resources:
+                  requests:
+                    cpu: 20m
+                    memory: 32Mi
+                  limits:
+                    cpu: 100m
+                    memory: 64Mi
+                readinessProbe:
+                  httpGet:
+                    path: /metrics
+                    port: 9205
+                  initialDelaySeconds: 10
+                  periodSeconds: 30
+
+- name: Create Nextcloud Exporter Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: nextcloud-exporter
+        namespace: nextcloud
+        labels:
+          app: nextcloud-exporter
+      spec:
+        selector:
+          app: nextcloud-exporter
+        ports:
+          - name: metrics
+            port: 9205
+            targetPort: 9205
+            protocol: TCP
+
+- name: Create Nextcloud Exporter ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: nextcloud-exporter
+        namespace: nextcloud
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: nextcloud-exporter
+        namespaceSelector:
+          matchNames:
+            - nextcloud
+        endpoints:
+          - port: metrics
+            interval: 60s
+
+# Prometheus scrape ingress for the Nextcloud exporter (port 9205).
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: nextcloud
+    pod_selector: { app: nextcloud-exporter }
+    ports: [9205]
+    name_suffix: exporter-prometheus-scrape
+
+# Exporter -> Nextcloud (for the serverinfo API). The matching ingress rule on
+# Nextcloud lives below.
+- name: "[netpol/nextcloud] exporter -> nextcloud egress (port 80)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: nextcloud-allow-exporter-egress
+        namespace: nextcloud
+      spec:
+        podSelector:
+          matchLabels:
+            app: nextcloud-exporter
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - podSelector:
+                  matchLabels:
+                    app: nextcloud
+            ports:
+              - { protocol: TCP, port: 80 }
+
+- name: "[netpol/nextcloud] exporter -> nextcloud ingress (port 80)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: nextcloud-allow-exporter-ingress
+        namespace: nextcloud
+      spec:
+        podSelector:
+          matchLabels:
+            app: nextcloud
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app: nextcloud-exporter
+            ports:
+              - { protocol: TCP, port: 80 }
+
+################################################################################
+#  ConfigMap (Grafana Dashboard) — upstream xperimental/nextcloud-exporter
+################################################################################
+- name: Create Nextcloud Grafana dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nextcloud-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        nextcloud-dashboard.json: "{{ lookup('file', 'files/nextcloud-dashboard.json') | string }}"
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for nextcloud
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: nextcloud-monitor
+        namespace: nextcloud
+      spec:
+        config:
+          type: http
+          name: nextcloud
+          url: "http://nextcloud.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

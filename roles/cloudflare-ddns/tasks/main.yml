@@ -1,0 +1,106 @@
+---
+- name: Install required packages
+  apt:
+    name:
+      - git
+      - curl
+      - cron
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Create cloudflare-ddns directory
+  file:
+    path: "{{ cloudflare_ddns_install_dir }}"
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Clone cloudflare-ddns-updater repository
+  git:
+    repo: 'https://github.com/K0p1-Git/cloudflare-ddns-updater.git'
+    dest: "{{ cloudflare_ddns_install_dir }}"
+    version: e9906c3aa0b73c26e3473618ad7a69db853e669d
+    force: yes
+  become: yes
+
+- name: Configure cloudflare scripts for multiple records
+  block:
+    - name: Create individual scripts for each DNS record
+      copy:
+        src: "{{ cloudflare_ddns_install_dir }}/cloudflare-template.sh"
+        dest: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        remote_src: yes
+        mode: '0755'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure auth_email for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^auth_email='
+        line: 'auth_email="{{ cloudflare.auth_email }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure auth_method for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^auth_method='
+        line: 'auth_method="{{ cloudflare.auth_method | default("token") }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure api_token for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^auth_key='
+        line: 'auth_key="{{ cloudflare.api_token }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure zone_identifier for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^zone_identifier='
+        line: 'zone_identifier="{{ cloudflare.zone_identifier }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure record_name for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^record_name='
+        line: 'record_name="{{ item.name }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Configure proxy for each record
+      lineinfile:
+        path: "{{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+        regexp: '^proxy='
+        line: 'proxy="{{ item.proxy | default("false") }}"'
+      become: yes
+      loop: "{{ cloudflare.records }}"
+
+    - name: Execute each cloudflare-ddns script immediately
+      command: "/bin/bash {{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+      become: yes
+      loop: "{{ cloudflare.records }}"
+      register: cloudflare_ddns_results
+      changed_when: cloudflare_ddns_results.rc == 0
+  when: cloudflare is defined and cloudflare.records is defined
+
+- name: Set up cron jobs for cloudflare-ddns
+  cron:
+    name: "Cloudflare DDNS Updater - {{ item.name }}"
+    minute: "{{ cloudflare_ddns_cron_minute }}"
+    hour: "{{ cloudflare_ddns_cron_hour }}"
+    day: "{{ cloudflare_ddns_cron_day }}"
+    month: "{{ cloudflare_ddns_cron_month }}"
+    weekday: "{{ cloudflare_ddns_cron_weekday }}"
+    job: "/bin/bash {{ cloudflare_ddns_install_dir }}/cloudflare-{{ item.name | replace('*', 'wildcard') | replace('.', '-') }}.sh"
+    user: root
+  become: yes
+  loop: "{{ cloudflare.records }}"
+  when: cloudflare_ddns_enable_cron | bool and cloudflare is defined and cloudflare.records is defined

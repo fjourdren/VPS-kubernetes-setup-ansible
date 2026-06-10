@@ -1,0 +1,16 @@
+# Managed by Ansible — do not edit manually.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    {{ interface }}:
+      dhcp4: false
+      dhcp6: false
+      addresses:
+        - {{ ipv4_address }}/{{ (ipv4_address ~ '/' ~ netmask) | ansible.utils.ipaddr('prefix') }}
+      routes:
+        - to: default
+          via: {{ gateway }}
+      nameservers:
+        addresses: [{{ dns_servers | join(', ') }}]
+        search: [{{ domain }}]

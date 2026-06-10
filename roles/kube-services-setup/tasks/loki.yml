@@ -1,0 +1,228 @@
+################################################################################
+#  Loki + Promtail (Helm, single-binary mode)
+#
+#  Logs are visible in Grafana via the auto-registered datasource below
+#  (label `grafana_datasource: "1"` is picked up by the kube-prometheus-stack
+#  Grafana sidecar — see prometheus.yml).
+################################################################################
+
+################################################################################
+#  Helm Repository
+################################################################################
+- name: Add Grafana Helm repository
+  kubernetes.core.helm_repository:
+    name: grafana
+    repo_url: https://grafana.github.io/helm-charts
+
+################################################################################
+#  Loki — single binary
+################################################################################
+- name: Install Loki (single-binary)
+  kubernetes.core.helm:
+    name: loki
+    chart_ref: grafana/loki
+    namespace: logging
+    create_namespace: true
+    values:
+      deploymentMode: SingleBinary
+      loki:
+        auth_enabled: false
+        commonConfig:
+          replication_factor: 1
+        storage:
+          type: filesystem
+        schemaConfig:
+          configs:
+            - from: "2024-01-01"
+              store: tsdb
+              object_store: filesystem
+              schema: v13
+              index:
+                prefix: index_
+                period: 24h
+        limits_config:
+          retention_period: 168h  # 7 days
+          allow_structured_metadata: true
+          volume_enabled: true
+        compactor:
+          retention_enabled: true
+          delete_request_store: filesystem
+      singleBinary:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        persistence:
+          enabled: true
+          storageClass: nfs-runtime
+          size: 10Gi
+      # Disable scaled deployment modes — single-binary handles everything
+      backend:
+        replicas: 0
+      read:
+        replicas: 0
+      write:
+        replicas: 0
+      chunksCache:
+        enabled: false
+      resultsCache:
+        enabled: false
+      gateway:
+        enabled: false
+      lokiCanary:
+        enabled: false
+      monitoring:
+        selfMonitoring:
+          enabled: false
+          grafanaAgent:
+            installOperator: false
+        serviceMonitor:
+          enabled: true
+          labels:
+            release: prometheus-community
+      test:
+        enabled: false
+      # k8s-sidecar 2.5.0 ships Python 3.14 + strict urllib3 cert checks,
+      # which reject the microk8s in-cluster CA (no keyUsage extension).
+      # Disable strict x509 so the sidecar can list ConfigMaps/Secrets.
+      sidecar:
+        disableX509StrictVerification: true
+
+################################################################################
+#  Promtail — DaemonSet log shipper
+################################################################################
+- name: Install Promtail
+  kubernetes.core.helm:
+    name: promtail
+    chart_ref: grafana/promtail
+    namespace: logging
+    values:
+      config:
+        clients:
+          - url: http://loki.logging.svc.cluster.local:3100/loki/api/v1/push
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 128Mi
+      serviceMonitor:
+        enabled: true
+        labels:
+          release: prometheus-community
+
+################################################################################
+#  Grafana datasource — auto-discovered by the Grafana sidecar in the
+#  kube-prometheus-stack release (label `grafana_datasource: "1"`).
+################################################################################
+- name: Create Loki Grafana datasource
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: loki-datasource
+        namespace: logging
+        labels:
+          grafana_datasource: "1"
+      data:
+        loki-datasource.yaml: |
+          apiVersion: 1
+          datasources:
+            - name: Loki
+              uid: loki
+              type: loki
+              access: proxy
+              url: http://loki.logging.svc.cluster.local:3100
+              isDefault: true
+              editable: true
+              jsonData:
+                maxLines: 1000
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: logging }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: logging }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: logging }
+
+# Loki -> kube-apiserver (service discovery / auth).
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: logging }
+
+# Loki ingress: Promtail push (3100), Grafana queries (3100).
+- name: "[netpol/logging] Loki ingress (port 3100)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: logging-loki-ingress
+        namespace: logging
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: loki
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: promtail
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: monitoring
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kuma
+            ports:
+              - { protocol: TCP, port: 3100 }
+
+# Prometheus scrape — Loki self-metrics on 3100.
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: logging
+    pod_selector: { app.kubernetes.io/name: loki }
+    ports: [3100]
+    name_suffix: loki-prometheus-scrape
+
+# Prometheus scrape — Promtail self-metrics on 3101.
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: logging
+    pod_selector: { app.kubernetes.io/name: promtail }
+    ports: [3101]
+    name_suffix: promtail-prometheus-scrape
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for loki
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: loki-monitor
+        namespace: logging
+      spec:
+        config:
+          type: http
+          name: loki
+          url: "http://loki.logging.svc.cluster.local:3100/ready"
+          interval: 60
+          maxretries: 2

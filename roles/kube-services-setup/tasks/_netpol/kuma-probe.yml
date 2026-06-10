@@ -1,0 +1,39 @@
+################################################################################
+#  NetworkPolicy helper: ingress from Uptime Kuma
+#  Used by services that Kuma probes directly via TCP (databases, etc.).
+#  HTTP probes for services already reachable through Traefik don't need this
+#  helper — Kuma calls them through their public/private LB instead, gated by
+#  kuma-allow-traefik-lb-egress in kuma.yml.
+#  Required vars:
+#    ns:           target namespace
+#    pod_selector: matchLabels dict identifying the probed pods
+#    port:         single TCP port being probed
+#  Creates: <ns>-allow-kuma-probe
+################################################################################
+- name: "[netpol/{{ ns }}] Kuma TCP probe ingress (port {{ port }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-allow-kuma-probe"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector:
+          matchLabels: "{{ pod_selector }}"
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: kuma
+                podSelector:
+                  matchLabels:
+                    app: uptime-kuma
+            ports: "{{ [port] | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

@@ -1,0 +1,113 @@
+# LATER : Move here final services to manage their configs from gitops
+
+################################################################################
+#  Caution : untested code below, use at your own risk.
+#  Please review and adapt as necessary before using.
+#################################################################################
+
+################################################################################
+#  GitLab API Integration
+################################################################################
+- name: Set the GitLab "namespace/project" path
+  set_fact:
+    gitlab_project_path: "{{ argocd.gitlab_username }}/{{ argocd.gitlab_repo }}"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Get only the tree that sits under /gitops
+# ──────────────────────────────────────────────────────────────────────────────
+- name: Get /gitops directories from GitLab repo
+  uri:
+    url: "https://gitlab.com/api/v4/projects/{{ gitlab_project_path | replace('/', '%2F') }}/repository/tree?ref={{ argocd.gitlab_branch }}&per_page=100&type=tree&path=gitops"
+    method: GET
+    headers:
+      PRIVATE-TOKEN: "{{ argocd.gitlab_token }}"
+    return_content: yes
+    status_code: 200
+  register: gitlab_tree
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Pull just the folder names (strip the leading gitops/)
+# ──────────────────────────────────────────────────────────────────────────────
+- name: Populate gitlab_paths with /gitops sub-folder names
+  set_fact:
+    gitlab_paths: >-
+      {{ gitlab_tree.json
+         | selectattr('type', 'equalto', 'tree')
+         | map(attribute='path')
+         | map('regex_replace', '^gitops/', '')
+         | list }}
+
+################################################################################
+#  Wait for ArgoCD CRDs to be registered
+################################################################################
+- name: Wait for ArgoCD Application CRD to be registered
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: applications.argoproj.io
+  register: argo_application_crd
+  until: argo_application_crd.resources | length > 0
+  retries: 30
+  delay: 5
+
+################################################################################
+#  Secret (ArgoCD Repository Credentials)
+################################################################################
+- name: Add GitLab repo credentials to ArgoCD
+  kubernetes.core.k8s:
+    state: present
+    namespace: argocd
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: gitlab-creds
+        labels:
+          argocd.argoproj.io/secret-type: repo-creds
+      stringData:
+        url: https://gitlab.com/{{ argocd.gitlab_username }}/
+        username: "{{ argocd.gitlab_username }}"
+        password: "{{ argocd.gitlab_token }}"
+
+################################################################################
+#  Namespace (created BEFORE Applications so the first sync can apply manifests)
+################################################################################
+- name: Ensure namespaces exist for each gitops app
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item }}"
+  loop: "{{ gitlab_paths }}"
+
+################################################################################
+#  Application (ArgoCD) — one per /gitops/<folder>
+################################################################################
+- name: Create ArgoCD Applications for each /gitops directory
+  kubernetes.core.k8s:
+    state: present
+    namespace: argocd
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "{{ item }}-app"
+        namespace: argocd
+      spec:
+        project: default
+        source:
+          repoURL: https://gitlab.com/{{ gitlab_project_path }}.git
+          targetRevision: "{{ argocd.gitlab_branch }}"
+          path: "gitops/{{ item }}"
+        destination:
+          server: https://kubernetes.default.svc
+          namespace: "{{ item }}"
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=true
+  loop: "{{ gitlab_paths }}"

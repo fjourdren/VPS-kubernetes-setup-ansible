@@ -1,0 +1,262 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create n8n namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: n8n
+
+################################################################################
+#  PersistentVolumeClaim
+################################################################################
+- name: Create PVC for n8n data
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: n8n-data
+        namespace: n8n
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy n8n Deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: n8n
+        namespace: n8n
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: n8n
+        template:
+          metadata:
+            labels:
+              app: n8n
+            annotations:
+              # Velero: backs up the n8n-data PVC via FSB (Kopia).
+              backup.velero.io/backup-volumes: "n8n-data"
+              # Pre-hook fallback chain: n8n CLI export -> sqlite3 .backup -> apk add sqlite
+              # + .backup -> cp. n8n hardened image: no sqlite3 CLI, no apk, runs as uid 1000
+              # -> n8n branch wins. Restore = n8n import:workflow / import:credentials from
+              # /home/node/.n8n/backup/.
+              pre.hook.backup.velero.io/container: "n8n"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/home/node/.n8n/database.sqlite; OUT=/home/node/.n8n/database.backup.sqlite; BAK=/home/node/.n8n/backup; if command -v n8n >/dev/null 2>&1; then rm -rf \"$BAK\" && mkdir -p \"$BAK/workflows\" \"$BAK/credentials\" && n8n export:workflow --all --backup --output=\"$BAK/workflows/\" && n8n export:credentials --all --backup --output=\"$BAK/credentials/\"; elif command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+          spec:
+            securityContext:
+              runAsUser: 1000
+              runAsGroup: 1000
+              fsGroup: 1000
+            containers:
+              - name: n8n
+                image: n8nio/n8n
+                ports:
+                  - containerPort: 5678
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 256Mi
+                  limits:
+                    cpu: 1000m
+                    memory: 512Mi
+                volumeMounts:
+                  - name: n8n-data
+                    mountPath: /home/node/.n8n
+                env:
+                  - name: N8N_SECURE_COOKIE
+                    value: "false"
+                  - name: N8N_METRICS
+                    value: "true"
+            volumes:
+              - name: n8n-data
+                persistentVolumeClaim:
+                  claimName: n8n-data
+
+################################################################################
+#  Service
+################################################################################
+- name: Create n8n Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: n8n
+        namespace: n8n
+        labels:
+          app: n8n
+      spec:
+        selector:
+          app: n8n
+        ports:
+          - port: 80
+            targetPort: 5678
+            protocol: TCP
+            name: http
+          - port: 5678
+            targetPort: 5678
+            protocol: TCP
+            name: metrics
+
+################################################################################
+#  IngressRoute - n8n (Private - HTTP & HTTPS)
+################################################################################
+- name: Create n8n IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: n8n
+        namespace: n8n
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`n8n.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: n8n
+                port: 80
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: n8n }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: n8n }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: n8n
+    pod_selector: { app: n8n }
+    port: 5678
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: n8n
+    pod_selector: { app: n8n }
+    ports: [5678]
+
+# Allow ingress from the n8n-webhook-proxy pod (matching n8n-webhook-proxy
+# NetPol that egresses to n8n on 5678).
+- name: "[netpol/n8n] webhook-proxy ingress (port 5678)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: n8n-allow-webhook-proxy-ingress
+        namespace: n8n
+      spec:
+        podSelector:
+          matchLabels:
+            app: n8n
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: n8n-webhook-proxy
+                podSelector:
+                  matchLabels:
+                    app: n8n-webhook-proxy
+            ports:
+              - { protocol: TCP, port: 5678 }
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: n8n
+    pod_selector: { app: n8n }
+
+################################################################################
+#  ServiceMonitor (Prometheus Operator)
+################################################################################
+- name: Create n8n ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: n8n
+        namespace: n8n
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: n8n
+        namespaceSelector:
+          matchNames:
+            - n8n
+        endpoints:
+          - port: metrics
+            path: /metrics
+            interval: 30s
+
+################################################################################
+#  ConfigMap (Grafana Dashboard) — community ID 11159 "NodeJS Application"
+#  n8n is a Node.js app and exposes default Node + custom n8n metrics on
+#  N8N_METRICS=true; the NodeJS dashboard fits the default-emit-set.
+################################################################################
+- name: Create n8n Grafana dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: n8n-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        n8n-dashboard.json: "{{ lookup('file', 'files/n8n-dashboard.json') | string }}"
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for n8n
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: n8n-monitor
+        namespace: n8n
+      spec:
+        config:
+          type: http
+          name: n8n
+          url: "http://n8n.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

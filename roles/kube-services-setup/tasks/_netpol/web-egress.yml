@@ -1,0 +1,43 @@
+################################################################################
+#  NetworkPolicy helper: web egress to the Internet (LAN blocked)
+#  Allow egress to 0.0.0.0/0 and ::/0 on the requested ports, with the LAN
+#  CIDR (network.private_cidr) explicitly removed for IPv4. Pairs with
+#  block-local-access.yml: that policy adds the same LAN block at the
+#  namespace level, this one re-opens Internet egress for specific pods.
+#  Required vars:
+#    ns: target namespace
+#  Optional vars:
+#    pod_selector: matchLabels dict (default {} = all pods in the namespace)
+#    name_suffix:  policy name suffix (default "web")
+#    ports:        list of TCP ports to allow (default [80, 443])
+#  Creates: <ns>-allow-<name_suffix>-egress
+################################################################################
+- name: "[netpol/{{ ns }}] {{ name_suffix | default('web') }} egress (LAN blocked)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-allow-{{ name_suffix | default('web') }}-egress"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector:
+          matchLabels: "{{ pod_selector | default({}) }}"
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+            ports: "{{ ports | default([80, 443]) | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
+          - to:
+              - ipBlock:
+                  cidr: ::/0
+            ports: "{{ ports | default([80, 443]) | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

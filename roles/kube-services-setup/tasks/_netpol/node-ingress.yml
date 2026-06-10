@@ -1,0 +1,30 @@
+################################################################################
+#  NetworkPolicy helper: node ingress
+#  Allow ingress from the node CIDR. Kubelet probes (liveness/readiness)
+#  originate from the node IP, not from a pod, so they need an ipBlock-based
+#  rule rather than a pod/namespace selector.
+#  Required vars:
+#    ns: target namespace
+#  Creates: <ns>-allow-node-ingress
+################################################################################
+- name: "[netpol/{{ ns }}] node ingress (kubelet probes)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-allow-node-ingress"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector: {}
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - ipBlock:
+                  cidr: "{{ network.private_cidr }}"
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

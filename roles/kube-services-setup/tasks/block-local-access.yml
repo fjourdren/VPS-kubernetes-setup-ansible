@@ -1,0 +1,35 @@
+- name: Get all namespaces
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+  register: ns_list
+
+- name: Apply egress policy to namespaces (block LAN except gateway + NFS)
+  vars:
+    excluded_namespaces:
+      - kube-system # Mainly for NFS access to the host server
+      - kube-public
+      - kube-node-lease
+      #- container-registry
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: block-local-lan-egress-except-gw-nfs
+        namespace: "{{ item.metadata.name }}"
+      spec:
+        podSelector: {}
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+          - to:
+              - ipBlock:
+                  cidr: "{{ network.host_gateway }}/32"
+  loop: "{{ ns_list.resources }}"
+  when: item.metadata.name not in excluded_namespaces

@@ -1,0 +1,67 @@
+- name: Configure DNS servers
+  template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+
+- name: Save hostname for next reboots
+  template:
+    src: hostname.j2
+    dest: /etc/hostname
+
+- name: Set hostname
+  command: hostnamectl set-hostname "{{ hostname }}"
+  when: ansible_facts['hostname'] != hostname
+
+- name: Add hostname to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "127.0.1.1 {{ hostname }}"
+    regexp: '^127\.0\.1\.1\s+'
+    state: present
+
+- name: Ensure localhost entries in /etc/hosts
+  blockinfile:
+    path: /etc/hosts
+    block: |
+      127.0.0.1 localhost
+      ::1 localhost ip6-localhost ip6-loopback
+    marker: "# {mark} ANSIBLE MANAGED LOCALHOST"
+    insertbefore: BOF
+
+- name: Disable cloud-init network management
+  ansible.builtin.copy:
+    dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: "network: {config: disabled}\n"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: List foreign netplan configs
+  ansible.builtin.find:
+    paths: /etc/netplan
+    patterns: '*.yaml,*.yml'
+    excludes: '99-ansible.yaml'
+  register: existing_netplan
+
+- name: Remove foreign netplan configs (cloud-init, installer, etc.)
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ existing_netplan.files }}"
+
+- name: Write netplan static config
+  ansible.builtin.template:
+    src: netplan.yaml.j2
+    dest: /etc/netplan/99-ansible.yaml
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Validate netplan config (generate only, no apply)
+  ansible.builtin.command: netplan generate
+  changed_when: false
+
+- name: Ensure systemd-networkd is enabled (netplan renderer)
+  ansible.builtin.systemd:
+    name: systemd-networkd
+    enabled: true

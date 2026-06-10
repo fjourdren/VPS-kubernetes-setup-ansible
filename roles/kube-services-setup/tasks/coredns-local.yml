@@ -1,0 +1,299 @@
+---
+################################################################################
+#  CoreDNS Local DNS Server
+#  Automatically detects private IngressRoutes and makes them accessible locally
+################################################################################
+
+################################################################################
+#  Namespace
+################################################################################
+- name: Create DNS namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: dns-system
+
+################################################################################
+#  ConfigMap for CoreDNS
+################################################################################
+- name: Create CoreDNS ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: coredns-custom
+        namespace: dns-system
+      data:
+        Corefile: |
+          {{ network.private_domain }}:53 {
+            errors
+            health {
+              lameduck 5s
+            }
+            ready
+            
+            # Local domain resolution
+            file /etc/coredns/private.db {{ network.private_domain }}
+            
+            log
+            prometheus :9153
+          }
+          
+          # Forward cluster.local lookups to MicroK8s' kube-dns so pods
+          # using coredns-local (e.g. uptime-kuma with dnsPolicy: None) can
+          # still resolve in-cluster services like postgresql.postgresql.svc
+          # instead of falling through to the .lan wildcard.
+          cluster.local:53 {
+            errors
+            cache 30
+            forward . 10.152.183.10
+          }
+
+          .:53 {
+            errors
+            health {
+              lameduck 5s
+            }
+            ready
+
+            # Forward to upstream DNS
+            forward . 9.9.9.9 8.8.8.8 {% if network.dns is defined %}{{ network.dns }} {% endif %}
+
+            cache 30
+            loop
+            reload
+            loadbalance
+            prometheus :9153
+          }
+        
+        private.db: |
+          $ORIGIN {{ network.private_domain }}.
+          @   3600 IN SOA sns.dns.icann.org. noc.dns.icann.org. (
+                      2024110801 ; serial
+                      7200       ; refresh
+                      3600       ; retry
+                      1209600    ; expire
+                      3600       ; minimum
+                      )
+          
+          ; Private network services
+          @                       IN  A     {{ network.private_address }}
+          *                       IN  A     {{ network.private_address }}
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy CoreDNS
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: coredns-local
+        namespace: dns-system
+        labels:
+          app: coredns-local
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: coredns-local
+        template:
+          metadata:
+            labels:
+              app: coredns-local
+          spec:
+            containers:
+            - name: coredns
+              image: coredns/coredns:latest
+              args:
+                - -conf
+                - /etc/coredns/Corefile
+              ports:
+              - containerPort: 53
+                name: dns
+                protocol: UDP
+              - containerPort: 53
+                name: dns-tcp
+                protocol: TCP
+              - containerPort: 9153
+                name: metrics
+                protocol: TCP
+              volumeMounts:
+              - name: config
+                mountPath: /etc/coredns
+                readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+              livenessProbe:
+                httpGet:
+                  path: /health
+                  port: 8080
+                initialDelaySeconds: 60
+                timeoutSeconds: 5
+              readinessProbe:
+                httpGet:
+                  path: /ready
+                  port: 8181
+                initialDelaySeconds: 10
+                timeoutSeconds: 5
+            volumes:
+            - name: config
+              configMap:
+                name: coredns-custom
+
+################################################################################
+#  Service (LoadBalancer - exposed via MetalLB on private IP)
+################################################################################
+- name: Create CoreDNS Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: coredns-local
+        namespace: dns-system
+        labels:
+          app: coredns-local
+        annotations:
+          metallb.universe.tf/address-pool: private-pool
+          metallb.universe.tf/loadBalancerIPs: "{{ network.private_address }}"
+          metallb.universe.tf/allow-shared-ip: "dns-private"
+      spec:
+        type: LoadBalancer
+        selector:
+          app: coredns-local
+        ports:
+        - port: 53
+          targetPort: 53
+          protocol: UDP
+          name: dns-udp
+        - port: 53
+          targetPort: 53
+          protocol: TCP
+          name: dns-tcp
+
+################################################################################
+#  Service for Metrics
+################################################################################
+- name: Create CoreDNS Metrics Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: coredns-local-metrics
+        namespace: dns-system
+        labels:
+          app: coredns-local
+      spec:
+        selector:
+          app: coredns-local
+        ports:
+        - port: 9153
+          targetPort: 9153
+          protocol: TCP
+          name: metrics
+
+################################################################################
+#  ServiceMonitor for Prometheus
+################################################################################
+- name: Create CoreDNS ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: coredns-local
+        namespace: dns-system
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: coredns-local
+        namespaceSelector:
+          matchNames:
+            - dns-system
+        endpoints:
+          - port: metrics
+            interval: 30s
+
+################################################################################
+#  NetworkPolicy
+#  CoreDNS must remain reachable from every pod and from the LAN/Tailscale
+#  via the LB IP — there's no default-deny here on purpose. Ingress is
+#  pinned to DNS + health-probe ports; egress is the upstream DNS path with
+#  LAN blocked.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- name: "[netpol/dns-system] CoreDNS ingress (DNS + health-probe ports)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: dns-system-coredns-ingress
+        namespace: dns-system
+      spec:
+        podSelector:
+          matchLabels:
+            app: coredns-local
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+              - ipBlock:
+                  cidr: "::/0"
+            ports:
+              - { protocol: UDP, port: 53 }
+              - { protocol: TCP, port: 53 }
+              - { protocol: TCP, port: 8080 }
+              - { protocol: TCP, port: 8181 }
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: dns-system
+    pod_selector: { app: coredns-local }
+    ports: [9153]
+
+# Upstream DNS resolution (block LAN — we forward only to public resolvers).
+- name: "[netpol/dns-system] CoreDNS upstream egress (DNS, LAN blocked)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: dns-system-coredns-allow-upstream-egress
+        namespace: dns-system
+      spec:
+        podSelector:
+          matchLabels:
+            app: coredns-local
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+            ports:
+              - { protocol: UDP, port: 53 }
+              - { protocol: TCP, port: 53 }

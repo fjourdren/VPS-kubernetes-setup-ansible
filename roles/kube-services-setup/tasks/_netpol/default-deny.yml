@@ -1,0 +1,23 @@
+################################################################################
+#  NetworkPolicy helper: default-deny
+#  Required vars:
+#    ns: target namespace
+#  Creates: <ns>-default-deny
+################################################################################
+- name: "[netpol/{{ ns }}] default-deny"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-default-deny"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector: {}
+        policyTypes: [Ingress, Egress]
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

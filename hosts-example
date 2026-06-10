@@ -1,0 +1,20 @@
+# Add hosts here, one per line. Additional groups can be created using
+# [group] syntax. Hosts can join multiple groups.
+
+[provisionning]
+provisionning-server1 ansible_host=192.168.1.10 ansible_user=root ansible_ssh_pass=mypassword ansible_become_pass=mypassword
+
+# Control-plane (HA) nodes. List 1 node for a single-node cluster, or 3+ for HA.
+[microk8s_HA]
+server1 ansible_host=192.168.1.201 ansible_user=ansible ansible_ssh_pass=mypassword ansible_become_pass=mypassword ansible_port=30000
+#server2 ansible_host=192.168.1.202 ansible_user=ansible ansible_ssh_pass=mypassword ansible_become_pass=mypassword ansible_port=30000
+#server3 ansible_host=192.168.1.203 ansible_user=ansible ansible_ssh_pass=mypassword ansible_become_pass=mypassword ansible_port=30000
+
+# Worker nodes (no control-plane). To add workers, uncomment this group AND the
+# microk8s_WORKERS line under [kubernetes:children] below.
+#[microk8s_WORKERS]
+#worker1 ansible_host=192.168.1.211 ansible_user=ansible ansible_ssh_pass=mypassword ansible_become_pass=mypassword ansible_port=30000
+
+[kubernetes:children]
+microk8s_HA
+#microk8s_WORKERS

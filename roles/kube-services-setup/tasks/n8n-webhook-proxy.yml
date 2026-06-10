@@ -1,0 +1,330 @@
+################################################################################
+#  Build Docker Image
+################################################################################
+- name: Install buildah for building images
+  apt:
+    name: buildah
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Prepare and build n8n-webhook-proxy image when needed
+  block:
+    - name: Create build directory on server
+      file:
+        path: /tmp/n8n-webhook-proxy-build
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Copy n8n-webhook-proxy build files to server
+      copy:
+        src: "{{ playbook_dir }}/n8n-webhook-proxy/"
+        dest: /tmp/n8n-webhook-proxy-build/
+        mode: '0644'
+      become: true
+      register: n8n_build_sources
+
+    - name: Check if n8n-webhook-proxy image already exists
+      command: buildah images -q localhost:32000/n8n-webhook-proxy:latest
+      register: n8n_image_check
+      changed_when: false
+      failed_when: false  # au cas où l'image n'existe pas encore
+
+    - name: Build image with buildah (only when needed)
+      shell: |
+        cd /tmp/n8n-webhook-proxy-build
+        buildah bud --format=docker -t localhost:32000/n8n-webhook-proxy:latest -f dockerfile .
+      args:
+        executable: /bin/bash
+      when: n8n_build_sources.changed or n8n_image_check.stdout == ""
+
+    - name: Push image to MicroK8s registry (only when needed)
+      shell: |
+        buildah push --tls-verify=false \
+          localhost:32000/n8n-webhook-proxy:latest \
+          docker://127.0.0.1:32000/n8n-webhook-proxy:latest
+      when: n8n_build_sources.changed or n8n_image_check.stdout == ""
+
+    - name: Clean up build directory (only when build was (re)done)
+      file:
+        path: /tmp/n8n-webhook-proxy-build
+        state: absent
+      become: true
+      when: n8n_build_sources.changed or n8n_image_check.stdout == ""
+
+################################################################################
+#  Namespace
+################################################################################
+- name: Create n8n-webhook-proxy namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: n8n-webhook-proxy
+
+################################################################################
+#  ConfigMap
+################################################################################
+- name: Create n8n-webhook-proxy ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: n8n-webhook-proxy-config
+        namespace: n8n-webhook-proxy
+      data:
+        RATE_LIMIT_WINDOW: "60000"
+        RATE_LIMIT_MAX: "100"
+
+################################################################################
+#  Secret
+################################################################################
+- name: Create n8n-webhook-proxy Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: n8n-webhook-proxy-secret
+        namespace: n8n-webhook-proxy
+      type: Opaque
+      stringData:
+        API_KEY: "{{ n8n_webhook_proxy.api_key }}"
+        # TARGETS must be a JSON string (array of {key,url})
+        # Build it from the dict and serialize to JSON to ensure it's a string, not a YAML list
+        TARGETS: "{{ n8n_webhook_proxy.targets | dict2items | json_query('[].{key: key, url: value}') | to_json }}"
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy n8n-webhook-proxy Deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: n8n-webhook-proxy
+        namespace: n8n-webhook-proxy
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: n8n-webhook-proxy
+        template:
+          metadata:
+            labels:
+              app: n8n-webhook-proxy
+          spec:
+            containers:
+              - name: n8n-webhook-proxy
+                image: localhost:32000/n8n-webhook-proxy:latest
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - containerPort: 3000
+                    name: http
+                envFrom:
+                  - configMapRef:
+                      name: n8n-webhook-proxy-config
+                  - secretRef:
+                      name: n8n-webhook-proxy-secret
+                livenessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 3000
+                  initialDelaySeconds: 10
+                  periodSeconds: 30
+                readinessProbe:
+                  httpGet:
+                    path: /healthz
+                    port: 3000
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+
+################################################################################
+#  Service
+################################################################################
+- name: Create n8n-webhook-proxy Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: n8n-webhook-proxy
+        namespace: n8n-webhook-proxy
+      spec:
+        selector:
+          app: n8n-webhook-proxy
+        ports:
+          - port: 80
+            targetPort: 3000
+            protocol: TCP
+            name: http
+
+################################################################################
+#  Certificate (Cert-Manager)
+################################################################################
+- include_tasks: _cf-acme-cleanup.yml
+  vars:
+    cf_acme_namespace: n8n-webhook-proxy
+    cf_acme_secret_name: n8n-webhook-proxy-cert-prod
+    cf_acme_dns_name: "webhook.{{ network.public_domain }}"
+
+- name: Request webhook.{{ network.public_domain }} certificate
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: n8n-webhook-proxy-cert-prod
+        namespace: n8n-webhook-proxy
+      spec:
+        secretName: n8n-webhook-proxy-cert-prod
+        issuerRef:
+          name: letsencrypt-prod
+          kind: ClusterIssuer
+        dnsNames:
+          - "webhook.{{ network.public_domain }}"
+
+################################################################################
+#  IngressRoute - n8n-webhook-proxy (Public - HTTP & HTTPS)
+################################################################################
+# Uncomment to use HTTP
+#- name: Create n8n-webhook-proxy IngressRoute HTTP
+#  kubernetes.core.k8s:
+#    state: present
+#    definition:
+#      apiVersion: traefik.io/v1alpha1
+#      kind: IngressRoute
+#      metadata:
+#        name: n8n-webhook-proxy-http
+#        namespace: n8n-webhook-proxy
+#      spec:
+#        entryPoints:
+#          - web-public
+#        routes:
+#          - match: Host(`webhook.{{ network.public_domain }}`)
+#            kind: Rule
+#            middlewares:
+#              - name: public-security
+#                namespace: traefik
+#            services:
+#              - name: n8n-webhook-proxy
+#                port: 80
+
+# Uncomment to redirect HTTP to HTTPS
+- name: Create n8n-webhook-proxy IngressRoute HTTP Redirect
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: n8n-webhook-proxy-http-redirect
+        namespace: n8n-webhook-proxy
+      spec:
+        entryPoints:
+          - web-public
+        routes:
+          - match: Host(`webhook.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+              - name: redirect-to-https
+                namespace: traefik
+            services:
+              - name: n8n-webhook-proxy
+                port: 80
+
+- name: Create n8n-webhook-proxy IngressRoute HTTPS
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: n8n-webhook-proxy-https
+        namespace: n8n-webhook-proxy
+      spec:
+        entryPoints:
+          - websecure-public
+        routes:
+          - match: Host(`webhook.{{ network.public_domain }}`)
+            kind: Rule
+            middlewares:
+              - name: public-security
+                namespace: traefik
+            services:
+              - name: n8n-webhook-proxy
+                port: 80
+        tls:
+          secretName: n8n-webhook-proxy-cert-prod
+                
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: n8n-webhook-proxy }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: n8n-webhook-proxy }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: n8n-webhook-proxy
+    pod_selector: { app: n8n-webhook-proxy }
+    port: 3000
+
+# n8n-webhook-proxy -> n8n (port 5678) — must match a specific pod, not just
+# the namespace, hence the inline policy rather than egress-to-namespace.yml.
+- name: "[netpol/n8n-webhook-proxy] egress -> n8n (port 5678)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: n8n-webhook-proxy-allow-n8n-egress
+        namespace: n8n-webhook-proxy
+      spec:
+        podSelector:
+          matchLabels:
+            app: n8n-webhook-proxy
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: n8n
+                podSelector:
+                  matchLabels:
+                    app: n8n
+            ports:
+              - { protocol: TCP, port: 5678 }
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for n8n-webhook-proxy
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: n8n-webhook-monitor
+        namespace: n8n-webhook-proxy
+      spec:
+        config:
+          type: http
+          name: n8n-webhook
+          url: "https://webhook.{{ network.public_domain }}"
+          interval: 60
+          maxretries: 2

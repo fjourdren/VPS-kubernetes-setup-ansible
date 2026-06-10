@@ -1,0 +1,53 @@
+################################################################################
+#  Helper: stale Cloudflare _acme-challenge TXT cleanup, per certificate.
+#
+#  cert-manager creates `_acme-challenge.<dns_name>` TXT records during DNS-01
+#  validation and removes them once Let's Encrypt validates. If a previous
+#  reinstall was interrupted mid-validation, these records linger on Cloudflare
+#  and the next validation gets confused (cert-manager's update-if-exists logic
+#  mixes the stale token with the new one).
+#
+#  We only purge the TXT records on Cloudflare when the matching TLS Secret
+#  does NOT yet exist in the cluster — meaning the cert hasn't been issued
+#  locally and cert-manager is about to (re)validate from scratch. If the
+#  Secret is already present, the cert is healthy or in flight and we leave
+#  Cloudflare alone.
+#
+#  Required vars:
+#    cf_acme_namespace   — namespace where the TLS Secret lives
+#    cf_acme_secret_name — name of the TLS Secret (cert-manager `secretName`)
+#    cf_acme_dns_name    — DNS name covered by the cert (e.g. nginx.example.com)
+################################################################################
+- name: "[{{ cf_acme_secret_name }}] Check if TLS Secret already exists locally"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: "{{ cf_acme_secret_name }}"
+    namespace: "{{ cf_acme_namespace }}"
+  register: cf_acme_existing_secret
+
+- name: "[{{ cf_acme_secret_name }}] Purge stale Cloudflare _acme-challenge TXT records"
+  when: cf_acme_existing_secret.resources | length == 0
+  block:
+    - name: "[{{ cf_acme_secret_name }}] List _acme-challenge.{{ cf_acme_dns_name }} TXT records on Cloudflare"
+      uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare.zone_identifier }}/dns_records?type=TXT&name=_acme-challenge.{{ cf_acme_dns_name }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ cloudflare.api_token }}"
+          Content-Type: "application/json"
+        return_content: yes
+      register: cf_acme_txt_lookup
+      no_log: true
+
+    - name: "[{{ cf_acme_secret_name }}] Delete stale _acme-challenge TXT records"
+      uri:
+        url: "https://api.cloudflare.com/client/v4/zones/{{ cloudflare.zone_identifier }}/dns_records/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ cloudflare.api_token }}"
+          Content-Type: "application/json"
+        status_code: [200, 404]
+      loop: "{{ cf_acme_txt_lookup.json.result | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"

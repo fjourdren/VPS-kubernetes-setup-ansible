@@ -1,0 +1,55 @@
+---
+- name: Ensure alias for kubectl is set in .bashrc
+  ansible.builtin.lineinfile:
+    path: ~/.bashrc
+    line: "alias kubectl='microk8s kubectl'"
+    create: yes
+  become: no
+
+- name: Apply changes to current shell
+  ansible.builtin.shell: source ~/.bashrc
+  args:
+    executable: /bin/bash
+  become: no
+
+- name: Add current user to microk8s group
+  become: true
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: microk8s
+    append: yes
+
+- name: Reset connection to apply group changes
+  meta: reset_connection
+
+- name: Verify user belongs to microk8s group
+  command: groups
+  register: user_groups
+  changed_when: false
+
+- name: Ensure .kube directory exists for current user
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+
+- name: Copy MicroK8s client config to current user's .kube directory
+  become: true
+  ansible.builtin.copy:
+    src: /var/snap/microk8s/current/credentials/client.config
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: yes
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Ensure current user owns their .kube directory
+  become: true
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    recurse: yes

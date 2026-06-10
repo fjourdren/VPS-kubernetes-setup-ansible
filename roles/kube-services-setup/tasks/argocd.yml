@@ -1,0 +1,199 @@
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add ArgoCD Helm Repo
+  kubernetes.core.helm_repository:
+    name: argo
+    repo_url: https://argoproj.github.io/argo-helm
+
+- name: Install ArgoCD via Helm
+  kubernetes.core.helm:
+    name: argocd
+    chart_ref: argo/argo-cd
+    namespace: argocd
+    create_namespace: true
+    values:
+      configs:
+        params:
+          server.insecure: "true"
+      server:
+        ingress:
+          enabled: false  # Disabled - using IngressRoute instead for explicit entrypoint control
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      controller:
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      repoServer:
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      dex: # LATER : https://github.com/argoproj/argo-cd/issues/16892
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      redis:
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      applicationSet:
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      notifications:
+        metrics:
+          enabled: true
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+
+################################################################################
+#  IngressRoute - ArgoCD (Private - HTTP & HTTPS)
+################################################################################
+- name: Create ArgoCD IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: argocd
+        namespace: argocd
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`argocd.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: argocd-server
+                port: 80
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: argocd }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: argocd }
+
+# ArgoCD components (server, controller, repo-server, redis, dex, applicationset,
+# notifications) talk to each other a lot — same-namespace traffic is permitted.
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: argocd }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: argocd }
+
+- include_tasks: _netpol/node-ingress.yml
+  vars: { ns: argocd }
+
+# Traefik -> argocd-server (HTTP 8080).
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: argocd
+    pod_selector: { app.kubernetes.io/name: argocd-server }
+    port: 8080
+    name_suffix: server-traefik
+
+# Prometheus scrape — ArgoCD metrics ports vary per component (8082-8084).
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: argocd
+    pod_selector: {}
+    ports: [8082, 8083, 8084]
+
+# repo-server egress to Git (HTTPS/HTTP/SSH) — allowed everywhere because
+# Git remotes can live on private hosts (self-hosted GitLab, etc.).
+- name: "[netpol/argocd] repo-server -> Git egress"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: argocd-repo-server-allow-git-egress
+        namespace: argocd
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: argocd-repo-server
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+              - ipBlock:
+                  cidr: "::/0"
+            ports:
+              - { protocol: TCP, port: 443 }
+              - { protocol: TCP, port: 80 }
+              - { protocol: TCP, port: 22 }
+
+# notifications-controller -> webhook providers (Internet, LAN blocked).
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: argocd
+    pod_selector: { app.kubernetes.io/name: argocd-notifications-controller }
+    name_suffix: notifications-web
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Grafana argocd dashboard 1
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-dashboard-1
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        argocd-dashboard1.json: "{{ lookup('file', 'files/argocd-dashboard1.json') | string }}"
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Grafana argocd dashboard 2
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: argocd-dashboard-2
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        argocd-dashboard2.json: "{{ lookup('file', 'files/argocd-dashboard2.json') | string }}"

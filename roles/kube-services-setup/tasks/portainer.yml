@@ -1,0 +1,115 @@
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add Portainer Helm repo
+  kubernetes.core.helm_repository:
+    name: portainer
+    repo_url: https://portainer.github.io/k8s/
+
+- name: Install Portainer via Helm
+  kubernetes.core.helm:
+    name: portainer
+    chart_ref: portainer/portainer
+    namespace: portainer
+    create_namespace: true
+    values:
+      service:
+        type: ClusterIP
+      ingress:
+        enabled: false
+      persistence:
+        storageClass: nfs-important-retain
+        size: 5Gi
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 256Mi
+
+- name: Annotate Portainer Deployment for Velero FSB backup
+  kubernetes.core.k8s:
+    state: present
+    merge_type: strategic-merge
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: portainer
+        namespace: portainer
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Velero FSB backs up the "data" volume of the Portainer chart
+              # (volume name created automatically by the chart from the data-portainer PVC).
+              backup.velero.io/backup-volumes: "data"
+
+################################################################################
+#  IngressRoute for Private Access
+################################################################################
+- name: Create Portainer private IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: portainer-private
+        namespace: portainer
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        middlewares:
+          - name: whitelist-local
+            namespace: traefik
+        routes:
+          - match: Host(`portainer.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: portainer
+                port: 9000
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: portainer }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: portainer }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: portainer
+    pod_selector: { app.kubernetes.io/name: portainer }
+    port: 9000
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: portainer }
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for portainer
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: portainer-monitor
+        namespace: portainer
+      spec:
+        config:
+          type: http
+          name: portainer
+          url: "http://portainer.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

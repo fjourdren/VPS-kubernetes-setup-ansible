@@ -1,0 +1,116 @@
+---
+- name: Check if this node is microk8s
+  ansible.builtin.stat:
+    path: /var/snap/microk8s/common/var/lib/kubelet
+  register: microk8s_kubelet_root
+
+- name: Check if NFS CSI driver is already installed
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: CSIDriver
+    name: nfs.csi.k8s.io
+  register: nfs_csi_driver
+  failed_when: false
+
+- name: Add the NFS CSI Helm repository (Canonical MicroK8s guide)
+  kubernetes.core.helm_repository:
+    name: csi-driver-nfs
+    repo_url: https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+  when:
+    - microk8s_kubelet_root.stat.exists
+    - nfs_csi_driver.resources | default([]) | length == 0
+
+- name: Install/upgrade NFS CSI driver via Helm (Canonical MicroK8s guide)
+  kubernetes.core.helm:
+    name: csi-driver-nfs
+    chart_ref: csi-driver-nfs/csi-driver-nfs
+    namespace: kube-system
+    create_namespace: true
+    values:
+      kubeletDir: /var/snap/microk8s/common/var/lib/kubelet
+      controller:
+        replicas: 1
+  when:
+    - microk8s_kubelet_root.stat.exists
+    - nfs_csi_driver.resources | default([]) | length == 0
+
+- name: Wait for NFS CSI driver pods to be ready
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app.kubernetes.io/name=csi-driver-nfs
+  register: nfs_csi_pods
+  until: >-
+    (nfs_csi_pods.resources | default([]) | length) > 0 and
+    ((nfs_csi_pods | json_query('resources[].status.containerStatuses[].ready') | default([])) | flatten | length) > 0 and
+    (((nfs_csi_pods | json_query('resources[].status.containerStatuses[].ready') | default([])) | flatten | min) | bool)
+  retries: 60
+  delay: 5
+  when:
+    - microk8s_kubelet_root.stat.exists
+    - nfs_csi_driver.resources | default([]) | length == 0
+
+- name: Create nfs-retain StorageClass
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: nfs-retain
+      provisioner: nfs.csi.k8s.io
+      parameters:
+        server: "{{ nfs.server }}"
+        share: /app-data
+        subDir: "${pvc.metadata.namespace}/${pvc.metadata.name}"
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+      mountOptions:
+        - hard
+        - nfsvers=4.1
+
+- name: Create nfs-runtime StorageClass
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: nfs-runtime
+      provisioner: nfs.csi.k8s.io
+      parameters:
+        server: "{{ nfs.server }}"
+        share: /app-data
+        subDir: "${pvc.metadata.namespace}/${pvc.metadata.name}"
+      reclaimPolicy: Delete
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+      mountOptions:
+        - hard
+        - nfsvers=4.1
+
+- name: Create nfs-important-retain StorageClass
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: nfs-important-retain
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "true"
+          storageclass.beta.kubernetes.io/is-default-class: "true"
+      provisioner: nfs.csi.k8s.io
+      parameters:
+        server: "{{ nfs.server }}"
+        share: /app-data/important
+        subDir: "${pvc.metadata.namespace}/${pvc.metadata.name}"
+      reclaimPolicy: Retain
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+      mountOptions:
+        - hard
+        - nfsvers=4.1

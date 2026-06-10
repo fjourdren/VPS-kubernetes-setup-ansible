@@ -1,0 +1,44 @@
+---
+- name: Apply node app settings to all Kubernetes nodes
+  hosts: kubernetes
+  roles:
+    - role: apps-nodes-settings
+
+# Install MicroK8s and form the cluster on EVERY node (HA control-plane + workers).
+- name: Install MicroK8s and form the cluster on all nodes
+  hosts: kubernetes
+  vars_files:
+    - secrets.yml # The secret needs to be loaded there (cannot be loaded for a specific role)
+  environment: # Needed to have access to snap binaries like microk8s, helm & update-ca-certificates from Ansible shell
+    PATH: "{{ ansible_env.PATH | default('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin') }}:/snap/bin:/usr/sbin" # LATER : remove this by managing path directly for the user (https://github.com/istvano/ansible_role_microk8s/blob/37b884cef272f57330aa6375d98dccd44e1d764a/defaults/main.yml#L54)
+  roles:
+    - role: kube-dependencies
+    - role: istvano.microk8s
+      vars:
+        microk8s_version: "1.34/stable"
+        microk8s_enable_HA: true
+        microk8s_plugins:
+          metrics-server: true
+          registry: true
+          helm3: true
+          cert-manager: true
+          #hostpath-storage: true # Disabled to use NFS storage instead
+          dns: "{{ network.dns }}"
+    - role: kube-user-setup
+
+# These roles must run from a single control-plane (HA) node: they fetch the
+# kubeconfig, deploy cluster-wide services, and update public DNS. run_once keeps
+# them off worker nodes and prevents multiple HA nodes from racing each other.
+- name: Configure cluster-wide services from a control-plane node
+  hosts: microk8s_HA
+  vars_files:
+    - secrets.yml
+  environment:
+    PATH: "{{ ansible_env.PATH | default('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin') }}:/snap/bin:/usr/sbin"
+  roles:
+    - role: cloudflare-ddns
+      run_once: true
+    - role: kube-config-download
+      run_once: true
+    - role: kube-services-setup
+      run_once: true

@@ -1,0 +1,14 @@
+FROM docker.io/library/node:18-alpine
+
+WORKDIR /app
+
+# No deps except axios + express + express-rate-limit
+COPY package*.json .
+RUN npm ci --only=production
+
+COPY index.js .
+
+EXPOSE 3000
+HEALTHCHECK CMD wget -qO- http://localhost:3000/healthz || exit 1
+
+CMD ["node", "index.js"]

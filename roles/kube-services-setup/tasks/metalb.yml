@@ -1,0 +1,177 @@
+################################################################################
+#  MetalLB installation via Helm (CRD mode)
+################################################################################
+- name: Ensure metallb-system namespace exists
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: metallb-system
+
+- name: Add MetalLB Helm repository
+  kubernetes.core.helm_repository:
+    name: metallb
+    repo_url: https://metallb.github.io/metallb
+
+- name: Install / Upgrade MetalLB via Helm
+  kubernetes.core.helm:
+    name: metallb
+    chart_ref: metallb/metallb
+    release_namespace: metallb-system
+    create_namespace: true
+    update_repo_cache: true
+    state: present
+    values:
+      speaker:
+        frr:
+          enabled: false
+      frrk8s:
+        enabled: false
+
+################################################################################
+#  Wait for MetalLB (CRDs + controller)
+################################################################################
+- name: Wait for IPAddressPool CRD to be available
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: ipaddresspools.metallb.io
+  register: ipaddresspool_crd
+  retries: 30
+  delay: 5
+  until: ipaddresspool_crd.resources | length > 0
+
+- name: Wait for MetalLB controller to be ready
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: metallb-controller
+    namespace: metallb-system
+  register: metallb_controller
+  retries: 60
+  delay: 5
+  until:
+    - metallb_controller.resources | length > 0
+    - (metallb_controller.resources[0].status.availableReplicas | default(0)) >= 1
+
+################################################################################
+#  Remove Default MetalLB Pool / L2Advertisement (if any)
+################################################################################
+- name: Get existing IPAddressPools
+  kubernetes.core.k8s_info:
+    api_version: metallb.io/v1beta1
+    kind: IPAddressPool
+    namespace: metallb-system
+  register: existing_pools
+
+- name: Remove default MetalLB pool if it exists
+  kubernetes.core.k8s:
+    state: absent
+    api_version: metallb.io/v1beta1
+    kind: IPAddressPool
+    name: "{{ item.metadata.name }}"
+    namespace: metallb-system
+  loop: "{{ existing_pools.resources }}"
+  when:
+    - item.metadata.name not in ['public-pool', 'private-pool']
+    - ansible_host in (item.spec.addresses | join(','))
+
+- name: Get existing L2Advertisements
+  kubernetes.core.k8s_info:
+    api_version: metallb.io/v1beta1
+    kind: L2Advertisement
+    namespace: metallb-system
+  register: existing_l2ads
+
+- name: Remove default L2Advertisement
+  kubernetes.core.k8s:
+    state: absent
+    api_version: metallb.io/v1beta1
+    kind: L2Advertisement
+    name: "{{ item.metadata.name }}"
+    namespace: metallb-system
+  loop: "{{ existing_l2ads.resources }}"
+  when:
+    - item.metadata.name not in ['public-advertisement', 'private-advertisement']
+
+################################################################################
+#  IPAddressPool for Public Services
+################################################################################
+- name: Create IPAddressPool for public services
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: public-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+          - "{{ network.public_address }}-{{ network.public_address }}"
+        autoAssign: false
+
+################################################################################
+#  IPAddressPool for Private Services
+################################################################################
+- name: Create IPAddressPool for private services
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: private-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+          - "{{ network.private_address }}-{{ network.private_address }}"
+        autoAssign: false
+
+################################################################################
+#  L2Advertisement for Public Pool
+################################################################################
+- name: Create L2Advertisement for public services
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: public-advertisement
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+          - public-pool
+
+################################################################################
+#  L2Advertisement for Private Pool
+################################################################################
+- name: Create L2Advertisement for private services
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: private-advertisement
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+          - private-pool
+
+################################################################################
+#  NetworkPolicy
+#  MetalLB intentionally has no default-deny: the speaker pod uses
+#  hostNetwork (NetworkPolicies don't apply to host-network pods anyway)
+#  and the controller needs broad cluster talk; least-privilege is achieved
+#  by the egress policies only.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: metallb-system }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: metallb-system }

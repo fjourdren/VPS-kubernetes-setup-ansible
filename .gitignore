@@ -1,0 +1,10 @@
+*.retry
+kubeconfig
+.qodo
+secrets.yml
+hosts
+
+**/in_progress
+TODO
+
+vault_password_file.txt

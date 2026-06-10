@@ -1,0 +1,79 @@
+################################################################################
+#  ClusterIssuer (Cert-Manager)
+################################################################################
+- name: Create Cloudflare API Token Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: cloudflare-api-token-secret
+        namespace: cert-manager
+      type: Opaque
+      stringData:
+        api-token: "{{ cloudflare.api_token }}"
+
+- name: Create Let's Encrypt ClusterIssuer for Traefik (Staging)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: letsencrypt-staging
+      spec:
+        acme:
+          email: "{{ letsencrypt.email }}"
+          server: https://acme-staging-v02.api.letsencrypt.org/directory
+          privateKeySecretRef:
+            name: letsencrypt-staging
+          solvers:
+            - dns01:
+                cloudflare:
+                  apiTokenSecretRef:
+                    name: cloudflare-api-token-secret
+                    key: api-token
+                  zoneID: "{{ cloudflare.zone_identifier }}"
+
+- name: Create Let's Encrypt ClusterIssuer for Traefik (Production)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: letsencrypt-prod
+      spec:
+        acme:
+          email: "{{ letsencrypt.email }}"
+          server: https://acme-v02.api.letsencrypt.org/directory
+          privateKeySecretRef:
+            name: letsencrypt-prod
+          solvers:
+            - dns01:
+                cloudflare:
+                  apiTokenSecretRef:
+                    name: cloudflare-api-token-secret
+                    key: api-token
+                  zoneID: "{{ cloudflare.zone_identifier }}"
+
+################################################################################
+#  NetworkPolicy
+#  cert-manager intentionally has no default-deny: the chart was installed
+#  by the istvano.microk8s role (snap addon) before this playbook runs and
+#  its components don't all carry consistent labels we can target.
+#  Egress-only policies are still applied for least privilege.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: cert-manager }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: cert-manager }
+
+# ACME HTTP-01/DNS-01 challenges + Cloudflare DNS API.
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: cert-manager
+    name_suffix: internet

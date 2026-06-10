@@ -1,0 +1,314 @@
+################################################################################
+#  Heimdall dashboard registry — Ansible is the source of truth.
+#  Each reconcile wipes every row carrying appid='__ansible_managed__' (hard
+#  delete + pivot detach) and re-creates the list below from scratch, so the
+#  DB is guaranteed to match this file. Items added through the Heimdall UI
+#  keep appid=NULL and are left untouched.
+#  Per-entry fields:
+#    title       (required) — display name AND idempotency key
+#    url         (required) — click target
+#    icon        (optional) — filename in /config/www/icons/ or full URL
+#    colour      (optional) — defaults to '#161b1f'
+#    description (optional)
+#    pinned      (optional) — defaults to true (shown on home /)
+#    order       (optional) — defaults to 0
+################################################################################
+- name: Define Heimdall apps registry
+  ansible.builtin.set_fact:
+    heimdall_apps:
+      # Private services (LAN/Tailscale)
+      - { title: Portainer,     url: "http://portainer.{{ network.private_domain }}",    pinned: true }
+      - { title: pgAdmin,       url: "http://pgadmin.{{ network.private_domain }}",      pinned: true }
+      - { title: Grafana,       url: "http://grafana.{{ network.private_domain }}",      pinned: true }
+      - { title: Prometheus,    url: "http://prometheus.{{ network.private_domain }}",   pinned: true }
+      - { title: Alertmanager,  url: "http://alertmanager.{{ network.private_domain }}", pinned: true }
+      - { title: "Uptime Kuma", url: "http://kuma.{{ network.private_domain }}",         pinned: true }
+      - { title: Traefik,       url: "http://traefik.{{ network.private_domain }}/dashboard/", pinned: true }
+      - { title: Ghostfolio,    url: "http://ghostfolio.{{ network.private_domain }}",   pinned: true }
+      - { title: Nextcloud,     url: "http://nextcloud.{{ network.private_domain }}",    pinned: true }
+      - { title: n8n,           url: "http://n8n.{{ network.private_domain }}",          pinned: true }
+      - { title: Jellyfin,      url: "http://jellyfin.{{ network.private_domain }}",     pinned: true }
+      - { title: qBittorrent,   url: "http://qbittorrent.{{ network.private_domain }}",  pinned: true }
+
+################################################################################
+#  Namespace
+################################################################################
+- name: Create namespace heimdall
+  k8s:
+    api_version: v1
+    kind: Namespace
+    name: heimdall
+    state: present
+
+################################################################################
+#  PersistentVolumeClaim
+################################################################################
+- name: Create PVC heimdall-pvc for Heimdall config
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: heimdall-pvc
+        namespace: heimdall
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy Heimdall Deployment
+  k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: heimdall
+        namespace: heimdall
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: heimdall
+        template:
+          metadata:
+            labels:
+              app: heimdall
+            annotations:
+              # Velero FSB: backs up the config PVC.
+              # Pre-hook fallback chain: sqlite3 .backup -> apk add sqlite + .backup -> cp.
+              # linuxserver/heimdall = alpine but sqlite3 not bundled -> apk branch wins.
+              backup.velero.io/backup-volumes: "config"
+              pre.hook.backup.velero.io/container: "heimdall"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/config/www/app.sqlite; OUT=/config/www/app.backup.sqlite; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+          spec:
+            containers:
+              - name: heimdall
+                image: linuxserver/heimdall:latest
+                ports:
+                  - containerPort: 80
+                resources:
+                  requests:
+                    cpu: 50m
+                    memory: 128Mi
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                volumeMounts:
+                  - name: config
+                    mountPath: /config
+            volumes:
+              - name: config
+                persistentVolumeClaim:
+                  claimName: heimdall-pvc
+
+################################################################################
+#  Service
+################################################################################
+- name: Expose Heimdall via a ClusterIP Service
+  k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: heimdall
+        namespace: heimdall
+      spec:
+        type: ClusterIP
+        selector:
+          app: heimdall
+        ports:
+          - protocol: TCP
+            port: 80
+            targetPort: 80
+
+################################################################################
+#  IngressRoute (Traefik v2)
+################################################################################
+- name: Create Traefik IngressRoute for Heimdall
+  k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: heimdall
+        namespace: heimdall
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        middlewares:
+          - name: whitelist-local
+            namespace: traefik
+        routes:
+          - match: "Host(`home.{{ network.private_domain }}`)"
+            kind: Rule
+            services:
+              - name: heimdall
+                port: 80
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: heimdall }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: heimdall }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: heimdall
+    pod_selector: { app: heimdall }
+    port: 80
+
+# Heimdall boots a Guzzle call to https://appslist.heimdall.site/list.json on
+# every artisan invocation (SupportedApps service). Without HTTPS egress the
+# 15s cURL timeout corrupts tinker stdout and breaks the reconcile task.
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: heimdall
+    pod_selector: { app: heimdall }
+    ports: [443]
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for heimdall
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: heimdall-monitor
+        namespace: heimdall
+      spec:
+        config:
+          type: http
+          name: heimdall
+          url: "http://home.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2
+
+################################################################################
+#  Reconcile Heimdall dashboard (Ansible = source of truth)
+#  - Upserts every entry from `heimdall_apps` (defined at the top of this file)
+#  - Soft-deletes any item with appid='__ansible_managed__' that is no longer
+#    in the list
+#  - Items added through the Heimdall UI (appid=NULL) are left alone
+#
+#  Heimdall has no API or CLI for managing items. We use `php artisan tinker
+#  --execute` against `App\Item` (Eloquent) — laravel/tinker is a production
+#  dependency of Heimdall, no extra packages or egress required.
+################################################################################
+- name: "[heimdall] wait for heimdall pod Ready"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: heimdall
+    label_selectors: [app=heimdall]
+    field_selectors: [status.phase=Running]
+  register: _heimdall_pod
+  until: >
+    (_heimdall_pod.resources | default([])) | length > 0 and
+    ((_heimdall_pod.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Ready')
+      | map(attribute='status') | list | first | default('False')) == 'True')
+  retries: 60
+  delay: 5
+
+- name: "[heimdall] reconcile dashboard items"
+  ansible.builtin.command:
+    argv:
+      - microk8s
+      - kubectl
+      - exec
+      - -n
+      - heimdall
+      - -c
+      - heimdall
+      - "{{ _heimdall_pod.resources[0].metadata.name }}"
+      - --
+      - php
+      - /app/www/artisan
+      - tinker
+      - --execute
+      - |-
+        $removed = 0; $created = 0;
+        try {
+            $marker  = '__ansible_managed__';
+            $desired = json_decode(base64_decode('{{ heimdall_apps | to_json | b64encode }}'), true);
+            if (!is_array($desired)) {
+                throw new \RuntimeException('json_decode failed: ' . json_last_error_msg());
+            }
+
+            // Wipe every previously-managed row (and its tag links) so the
+            // resulting state is exactly what's in $desired — no merge logic,
+            // no stale leftovers. forceDelete() bypasses SoftDeletes so the
+            // titles can be reinserted without unique-collision risk.
+            foreach (App\Item::where('appid', $marker)->get() as $i) {
+                $i->parents()->detach();
+                $i->forceDelete();
+                $removed++;
+            }
+
+            foreach ($desired as $app) {
+                $i = new App\Item();
+                $i->fill([
+                    'title'       => $app['title'],
+                    'url'         => $app['url'],
+                    'colour'      => $app['colour']      ?? '#161b1f',
+                    'icon'        => $app['icon']        ?? '',
+                    'description' => $app['description'] ?? '',
+                    'pinned'      => !empty($app['pinned'] ?? true) ? 1 : 0,
+                    'order'       => $app['order']       ?? 0,
+                    'type'        => 0,
+                    // user_id=0 → visible to anonymous visitors. The Item global
+                    // scope hides rows whose user_id != current session user; with
+                    // no auth configured, only user_id=0 renders.
+                    'user_id'     => 0,
+                    'appid'       => $marker,
+                ]);
+                $i->save();
+                // Attach to "Home dashboard" tag (id=0). The dash query is
+                // whereHas('parents', id=0)->pinned(); without this link the
+                // tile is stored but never rendered on /.
+                $i->parents()->attach(0);
+                $created++;
+            }
+            echo json_encode(['removed' => $removed, 'created' => $created]);
+        } catch (\Throwable $e) {
+            echo json_encode([
+                'error'          => $e->getMessage(),
+                'class'          => get_class($e),
+                'where'          => $e->getFile() . ':' . $e->getLine(),
+                'removed_so_far' => $removed,
+                'created_so_far' => $created,
+            ]);
+        }
+  register: _heimdall_reconcile
+  # rc!=0 catches kubectl/microk8s failures; empty stdout catches tinker
+  # being SIGKILLed or producing no output; "error" key catches PHP
+  # exceptions that the script's try/catch surfaced.
+  failed_when: >-
+    _heimdall_reconcile.rc != 0
+    or (_heimdall_reconcile.stdout | trim | length) == 0
+    or '"error":' in _heimdall_reconcile.stdout
+  changed_when: >-
+    (_heimdall_reconcile.stdout | trim | length) > 0
+    and ((_heimdall_reconcile.stdout | from_json).created > 0
+         or (_heimdall_reconcile.stdout | from_json).removed > 0)

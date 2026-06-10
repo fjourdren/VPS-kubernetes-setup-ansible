@@ -1,0 +1,171 @@
+################################################################################
+#  Namespace
+################################################################################
+- name: Create namespace if not exists
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "pgadmin"
+    state: present
+
+################################################################################
+#  PersistentVolumeClaim
+################################################################################
+- name: Create pgAdmin PVC
+  kubernetes.core.k8s:
+    namespace: "pgadmin"
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: pgadmin-pvc
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: nfs-important-retain
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy pgAdmin Deployment
+  kubernetes.core.k8s:
+    namespace: "pgadmin"
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: pgadmin
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: pgadmin
+        template:
+          metadata:
+            labels:
+              app: pgadmin
+            annotations:
+              # Velero FSB: backs up the pgadmin PVC (config + sessions).
+              # No hook: pgAdmin stores its config as JSON files / internal SQLite,
+              # FSB is enough for a homelab.
+              backup.velero.io/backup-volumes: "pgadmin-storage"
+          spec:
+            containers:
+              - name: pgadmin
+                image: dpage/pgadmin4:latest
+                securityContext:
+                  runAsUser: 0
+                  runAsGroup: 0
+                ports:
+                  - containerPort: 80
+                env:
+                  - name: CONFIG_DATABASE_URI
+                    value: "postgresql://{{ postgresql.username }}:{{ postgresql.password }}@postgresql.postgresql.svc.cluster.local:5432/postgres"
+                  - name: PGADMIN_DEFAULT_EMAIL
+                    value: "{{ pgadmin.email }}"
+                  - name: PGADMIN_DEFAULT_PASSWORD
+                    value: "{{ pgadmin.password }}"
+                  - name: PGADMIN_LISTEN_PORT
+                    value: "80"
+                volumeMounts:
+                  - name: pgadmin-storage
+                    mountPath: /var/lib/pgadmin
+            volumes:
+              - name: pgadmin-storage
+                persistentVolumeClaim:
+                  claimName: pgadmin-pvc
+
+################################################################################
+#  Service
+################################################################################
+- name: Create pgAdmin Service
+  kubernetes.core.k8s:
+    namespace: "pgadmin"
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: pgadmin
+      spec:
+        selector:
+          app: pgadmin
+        ports:
+          - protocol: TCP
+            port: 80
+            targetPort: 80
+        type: ClusterIP
+
+################################################################################
+#  IngressRoute - pgAdmin (Private - HTTP & HTTPS)
+################################################################################
+- name: Create pgAdmin IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: pgadmin
+        namespace: pgadmin
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`pgadmin.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: pgadmin
+                port: 80
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: pgadmin }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: pgadmin }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: pgadmin
+    pod_selector: { app: pgadmin }
+    port: 80
+
+- include_tasks: _netpol/egress-to-namespace.yml
+  vars:
+    ns: pgadmin
+    name: postgresql
+    pod_selector: { app: pgadmin }
+    target_namespace: postgresql
+    port: 5432
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for pgadmin
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: pgadmin-monitor
+        namespace: pgadmin
+      spec:
+        config:
+          type: http
+          name: pgadmin
+          url: "http://pgadmin.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

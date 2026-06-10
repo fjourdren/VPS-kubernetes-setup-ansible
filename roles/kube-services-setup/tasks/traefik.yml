@@ -1,0 +1,436 @@
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Fetch Cloudflare IPv4 ranges
+  uri:
+    url: https://www.cloudflare.com/ips-v4/
+    return_content: yes
+  register: cloudflare_ipv4_raw
+
+- name: Parse Cloudflare IPv4 ranges
+  set_fact:
+    cloudflare_ipv4_ranges: "{{ cloudflare_ipv4_raw.content.split('\n') | select('match', '^[0-9]') | list }}"
+
+- name: Fetch Cloudflare IPv6 ranges
+  uri:
+    url: https://www.cloudflare.com/ips-v6/
+    return_content: yes
+  register: cloudflare_ipv6_raw
+
+- name: Parse Cloudflare IPv6 ranges
+  set_fact:
+    cloudflare_ipv6_ranges: "{{ cloudflare_ipv6_raw.content.split('\n') | select('match', '^[0-9a-fA-F:]') | list }}"
+
+- name: Combine Cloudflare IP ranges
+  set_fact:
+    cloudflare_ip_ranges: "{{ cloudflare_ipv4_ranges + cloudflare_ipv6_ranges }}"
+
+- name: Add the Traefik Helm repository
+  kubernetes.core.helm_repository:
+    name: traefik
+    repo_url: https://helm.traefik.io/traefik
+
+- name: Install the Traefik Helm chart
+  kubernetes.core.helm:
+    name: traefik
+    chart_ref: traefik/traefik
+    namespace: traefik
+    create_namespace: true
+    values:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 64Mi
+        limits:
+          cpu: 1000m
+          memory: 256Mi
+      providers:
+        kubernetesCRD:
+          enabled: true
+          allowCrossNamespace: true
+      experimental:
+        plugins:
+          # Looks useless when the firewall bouncer is enabled but this manage cloudflare proxied IPs
+          crowdsec-bouncer:
+            moduleName: "github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin"
+            version: "v1.4.6"
+      logs:
+        access:
+          enabled: true
+          filters: {}       # garder vide pour tout logguer
+          fields:
+            general:
+              defaultMode: keep
+            headers:
+              defaultMode: keep
+      # Needed to allow CrowdSec plugin to write its cache/logs
+      securityContext:
+        readOnlyRootFilesystem: false
+      # Needed to allow CrowdSec plugin to write its cache/logs
+      podSecurityContext:
+        fsGroup: 65532      # Traefik UID/GID
+        fsGroupChangePolicy: "OnRootMismatch"
+      # Needed to allow CrowdSec plugin to write its cache/logs
+      deployment:
+        additionalVolumes:
+          - name: plugins
+            emptyDir: {}          # temporary storage for plugins
+      # Needed to allow CrowdSec plugin to write its cache/logs
+      additionalVolumeMounts:
+        - name: plugins
+          mountPath: /plugins-storage
+      extraObjects:
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: redirect-to-dashboard
+            namespace: traefik
+          spec:
+            redirectRegex:
+              regex: "^/$"
+              replacement: "/dashboard/"
+              permanent: true
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: crowdsec-bouncer
+            namespace: traefik
+          spec:
+            plugin:
+              crowdsec-bouncer:
+                enabled: true
+                crowdsecMode: stream
+                updateIntervalSeconds: 300
+                crowdsecLapiScheme: http
+                httpTimeoutSeconds: 30 # Increase timeout because my lapi pod can sometimes be slow
+                crowdsecLapiHost: "crowdsec-service.crowdsec.svc.cluster.local:8080"
+                crowdsecLapiKey: "{{ crowdsec.traefik_bouncer_key }}"
+                # Useful only in case there is another reverse-proxy in front of Traefik
+                forwardedHeadersTrustedIPs: "{{ cloudflare_ip_ranges }}"
+                # We don't want to block local IPs
+                #clientTrustedIPs: "{{ ['127.0.0.1/8', '192.168.0.0/16', '10.0.0.0/8'] }}"
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: public-security
+            namespace: traefik
+          spec:
+            chain:
+              middlewares:
+                - name: cloudflare-ips
+                - name: crowdsec-bouncer
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: cloudflare-ips
+            namespace: traefik
+          spec:
+            ipAllowList:
+              sourceRange: "{{ cloudflare_ip_ranges }}"
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: whitelist-local
+            namespace: traefik
+          spec:
+            ipAllowList:
+              sourceRange: "{{ ['127.0.0.1/8', '192.168.0.0/16', '10.0.0.0/8'] + (traefik.allowed_ips | default([])) }}"
+        - apiVersion: traefik.io/v1alpha1
+          kind: Middleware
+          metadata:
+            name: redirect-to-https
+            namespace: traefik
+          spec:
+            redirectScheme:
+              scheme: https
+              permanent: true
+      ingressRoute:
+        dashboard:
+          enabled: true
+          matchRule: "Host(`traefik.{{ network.private_domain }}`) && (PathPrefix(`/api`) || PathPrefix(`/dashboard`) || PathPrefix(`/`))"
+          entryPoints:
+            - web-private
+            - websecure-private
+          middlewares:
+            - name: redirect-to-dashboard
+            - name: whitelist-local
+      metrics:
+        prometheus:
+          disableAPICheck: false
+          service:
+            enabled: true
+      service:
+        enabled: false  # Disable default service since we use additionalServices
+        additionalServices:
+          public: # Public service for external access
+            enabled: true
+            single: true
+            spec:
+              type: LoadBalancer
+              # Preserve the real client source IP (no kube-proxy SNAT). Required so
+              # the CrowdSec bouncer middleware sees the actual Cloudflare edge IP
+              # (and then the real visitor IP via X-Forwarded-For) instead of a node
+              # IP — otherwise bans would target our own nodes and the Cloudflare
+              # trustedIPs list would never match. Trade-off: packets are dropped on
+              # nodes that don't run a Traefik pod, but MetalLB only announces the
+              # VIP from nodes that have one, so this is fine.
+              externalTrafficPolicy: Local
+            annotations:
+              metallb.universe.tf/address-pool: "public-pool"
+              metallb.universe.tf/loadBalancerIPs: "{{ network.public_address }}"
+              metallb.universe.tf/allow-shared-ip: "traefik-public"
+          private: # Private service for local access only
+            enabled: true
+            single: true
+            spec:
+              type: LoadBalancer
+            annotations:
+              metallb.universe.tf/address-pool: "private-pool"
+              metallb.universe.tf/loadBalancerIPs: "{{ network.private_address }}"
+              metallb.universe.tf/allow-shared-ip: "dns-private"
+      ports:
+        # Remove default web/websecure entry points (we use *-public / *-private below)
+        web: null
+        websecure: null
+        traefik:
+          port: 9003
+          exposedPort: 9003
+          protocol: TCP
+          expose:
+            default: false      # expose HTTP on default service
+            public: false      # expose HTTP on public service
+            private: false     # expose HTTP on private service
+
+        # My ports
+        minecraft:
+          port: 25565
+          exposedPort: 25565
+          protocol: TCP
+          expose:
+            public: true      # expose minecraft on public service
+        web-public:
+          port: 8080
+          exposedPort: 80
+          protocol: TCP
+          # Ensure real client IP is extracted behind Cloudflare
+          forwardedHeaders:
+            insecure: false
+            trustedIPs: "{{ cloudflare_ip_ranges }}"
+          expose:
+            public: true      # expose HTTP on public service
+        websecure-public:
+          port: 8443
+          exposedPort: 443
+          protocol: TCP
+          # Ensure real client IP is extracted behind Cloudflare
+          forwardedHeaders:
+            insecure: false
+            trustedIPs: "{{ cloudflare_ip_ranges }}"
+          expose:
+            public: true      # expose HTTPS on public service
+        web-private:
+          port: 8081
+          exposedPort: 80
+          protocol: TCP
+          expose:
+            private: true     # expose HTTP on private service
+        websecure-private:
+          port: 8444
+          exposedPort: 443
+          protocol: TCP
+          expose:
+            private: true     # expose HTTPS on private service
+
+      ####################
+      # Here is an example of how to setup a custom service. I don't know how make traefik uses this second service but good to know.
+      ####################
+      #service:
+      #  additionalServices:
+      #    minecraft:            # <- name MUST match "expose" key below
+      #      enabled: true
+      #      single: true
+      #ports:
+      #  minecraft:
+      #    port: 25565
+      #    exposedPort: 30000
+      #    protocol: TCP
+      #    expose:
+      #      minecraft: true      # expose this port on the "minecraft" service set in additionalServices
+
+################################################################################
+#  ServiceMonitor (Prometheus Operator)
+################################################################################
+- name: Create traefik ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: traefik
+        namespace: traefik
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+        namespaceSelector:
+          matchNames:
+            - traefik
+        endpoints:
+          - port: metrics
+            path: /metrics
+            interval: 30s
+            honorLabels: true
+            headers:
+              X-User-Id: "anonymous"
+              X-Tenant: "default"
+            metricRelabelings:
+              - sourceLabels: ["__name__"]
+                regex: ^fluentd_output_status_buffer_(oldest|newest)_.+
+                action: drop
+            relabelings:
+              - sourceLabels: ["__meta_kubernetes_pod_node_name"]
+                targetLabel: nodename
+                regex: (.*)
+                replacement: $1
+                action: replace
+
+################################################################################
+#  PrometheusRule (Prometheus Operator)
+################################################################################
+- name: Create traefik PrometheusRule
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: PrometheusRule
+      metadata:
+        name: traefik-rules
+        namespace: traefik
+        labels:
+          release: prometheus-community
+      spec:
+        groups:
+          - name: traefik.rules
+            rules:
+              - alert: TraefikDown
+                expr: up{job="traefik"} == 0
+                for: 5m
+                labels:
+                  context: traefik
+                  severity: warning
+                annotations:
+                  summary: "Traefik Down"
+                  description: "{{ '{{ $labels.pod }}' }} on {{ '{{ $labels.nodename }}' }} is down"
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: traefik }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: traefik }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: traefik }
+
+# Traefik is the public-facing reverse proxy: it must accept ingress from
+# every IP (the Cloudflare/CrowdSec gating happens at the L7 middleware
+# chain, not here).
+- name: "[netpol/traefik] all ingress (reverse proxy requirement)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: traefik-allow-all-ingress
+        namespace: traefik
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+              - ipBlock:
+                  cidr: "::/0"
+
+# Traefik -> CrowdSec LAPI for the bouncer plugin.
+- include_tasks: _netpol/egress-to-namespace.yml
+  vars:
+    ns: traefik
+    name: crowdsec
+    pod_selector: { app.kubernetes.io/name: traefik }
+    target_namespace: crowdsec
+    port: 8080
+
+# Traefik routes traffic to every application backend. Add a namespace here
+# when wiring a new app behind Traefik. No port restriction — backend ports
+# vary, and each backend's NetworkPolicy already gates ingress from the
+# traefik namespace anyway.
+- name: "[netpol/traefik] egress to backend application namespaces"
+  vars:
+    traefik_backend_namespaces:
+      - argocd
+      - heimdall
+      - nginx
+      - ghostfolio
+      - nextcloud
+      - wordpress
+      - n8n
+      - n8n-webhook-proxy
+      - pgadmin
+      - redisinsight
+      - minecraft
+      - kuma
+      - portainer
+      - monitoring
+      - logging
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: traefik-allow-apps-egress
+        namespace: traefik
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+        policyTypes: [Egress]
+        egress:
+          - to: "{{ traefik_backend_namespaces | map('community.general.dict_kv', 'kubernetes.io/metadata.name') | map('community.general.dict_kv', 'matchLabels') | map('community.general.dict_kv', 'namespaceSelector') | list }}"
+
+# Traefik -> Cloudflare API (DNS-01 challenge isn't done here; this covers
+# the CrowdSec plugin's HTTPS calls and any forward-auth call to a public
+# endpoint).
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: traefik
+    pod_selector: { app.kubernetes.io/name: traefik }
+    name_suffix: cloudflare
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Grafana Traefik dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: traefik-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        traefik-dashboard.json: "{{ lookup('file', 'files/traefik-dashboard.json') | string }}"

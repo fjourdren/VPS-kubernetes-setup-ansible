@@ -1,0 +1,159 @@
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add bitnami Helm repo
+  kubernetes.core.helm_repository:
+    name: bitnami
+    repo_url: https://charts.bitnami.com/bitnami
+
+- name: Install redis via Helm
+  kubernetes.core.helm:
+    name: redis
+    chart_ref: bitnami/redis
+    chart_version: "25.5.0"
+    namespace: redis
+    create_namespace: true
+    values:
+      architecture: standalone
+      auth:
+        password: "{{ redis.password }}"
+      master:
+        persistence:
+          storageClass: nfs-important-retain
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      metrics:
+        enabled: true
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        serviceMonitor:
+          enabled: true
+          namespace: redis
+          additionalLabels:
+            release: prometheus-community
+
+################################################################################
+#  Velero pre-backup annotations (post-helm patch).
+#  See the comment in the helm values block above for why these live here
+#  instead of `master.podAnnotations`.
+################################################################################
+- name: Annotate Redis master StatefulSet for Velero FSB backup
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: strategic-merge
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: redis-master
+        namespace: redis
+      spec:
+        template:
+          metadata:
+            annotations:
+              backup.velero.io/backup-volumes: "redis-data"
+              pre.hook.backup.velero.io/container: "redis"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning SAVE'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+
+################################################################################
+#  NetworkPolicy
+#  Redis is ClusterIP-only. Ingress is restricted to a fixed list of
+#  application namespaces — anything else (including the tailscale namespace)
+#  is rejected. See the redis_client_namespaces var below.
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: redis }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: redis }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: redis }
+
+# Application namespaces allowed to talk to Redis on 6379.
+# Add a namespace here when wiring a new app to Redis.
+- name: "[netpol/redis] clients ingress (port 6379)"
+  vars:
+    redis_client_namespaces:
+      - ghostfolio
+      - redisinsight
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: redis-allow-client-ingress
+        namespace: redis
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: redis
+        policyTypes: [Ingress]
+        ingress:
+          - from: "{{ redis_client_namespaces | map('community.general.dict_kv', 'kubernetes.io/metadata.name') | map('community.general.dict_kv', 'matchLabels') | map('community.general.dict_kv', 'namespaceSelector') | list }}"
+            ports:
+              - { protocol: TCP, port: 6379 }
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: redis
+    pod_selector: { app.kubernetes.io/name: redis }
+    ports: [9121]
+
+- include_tasks: _netpol/kuma-probe.yml
+  vars:
+    ns: redis
+    pod_selector: { app.kubernetes.io/name: redis }
+    port: 6379
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Redis dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: redis-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        redis-dashboard.json: "{{ lookup('file', 'files/redis-dashboard.json') | string }}"
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+#  TCP probe on the Redis master Service.
+################################################################################
+- name: Register Kuma monitor for redis
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: redis-monitor
+        namespace: redis
+      spec:
+        config:
+          type: port
+          name: redis
+          hostname: "redis-master.redis.svc.cluster.local"
+          port: 6379
+          interval: 60
+          maxretries: 2

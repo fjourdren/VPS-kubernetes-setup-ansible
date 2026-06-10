@@ -1,0 +1,237 @@
+################################################################################
+#  Jellyfin
+#
+#  Media server reading from the shared `media-library` PVC (RWX), populated
+#  by qBittorrent (see qbittorrent.yml). Jellyfin's libraries point at
+#  /media/movies and /media/tv; qBittorrent writes to the same physical NFS
+#  paths via /downloads/movies and /downloads/tv (same volume, different
+#  mount path).
+#
+#  Auto-flow: rely on Jellyfin's built-in scheduled library scan + real-time
+#  monitoring (default ON per library). The first-run wizard creates the
+#  admin user and lets you point libraries at /media/movies and /media/tv.
+################################################################################
+
+################################################################################
+#  Namespace (shared with qBittorrent)
+################################################################################
+- name: Create media namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: media
+
+################################################################################
+#  PersistentVolumeClaims
+#  - jellyfin-config: small, backed up by Velero (DB, metadata, library config)
+#  - media-library:   shared RWX volume with qBittorrent, NOT backed up (size)
+################################################################################
+- name: Create Jellyfin config PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: jellyfin-config
+        namespace: media
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 5Gi
+        storageClassName: nfs-important-retain
+
+- name: Create shared media-library PVC (RWX)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: media-library
+        namespace: media
+      spec:
+        accessModes: [ReadWriteMany]
+        resources:
+          requests:
+            storage: 200Gi
+        storageClassName: nfs-retain
+
+################################################################################
+#  Deployment
+################################################################################
+- name: Deploy Jellyfin
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: jellyfin
+        namespace: media
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: jellyfin
+        template:
+          metadata:
+            labels:
+              app: jellyfin
+            annotations:
+              # Velero FSB: backs up the config PVC. SQLite consistency hook
+              # mirrors the heimdall.yml pattern (sqlite3 .backup -> apk add ->
+              # cp fallback). The lscr.io/linuxserver/jellyfin image is
+              # Ubuntu-based (no apk) so the chain falls through to `cp`,
+              # which is acceptable: Jellyfin uses SQLite WAL and the DB is
+              # self-recoverable on next open. Media files (the shared
+              # `media-library` PVC mounted at /media) are NOT in this volume
+              # and are intentionally not backed up.
+              backup.velero.io/backup-volumes: "config"
+              pre.hook.backup.velero.io/container: "jellyfin"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/config/data/jellyfin.db; OUT=/config/data/jellyfin.backup.db; if [ ! -f \"$DB\" ]; then exit 0; fi; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+          spec:
+            securityContext:
+              fsGroup: 1000
+            containers:
+              - name: jellyfin
+                image: lscr.io/linuxserver/jellyfin:latest
+                env:
+                  - name: PUID
+                    value: "1000"
+                  - name: PGID
+                    value: "1000"
+                  - name: TZ
+                    value: "Europe/Paris"
+                ports:
+                  - containerPort: 8096
+                    name: http
+                resources:
+                  requests:
+                    cpu: 200m
+                    memory: 512Mi
+                  limits:
+                    cpu: 4
+                    memory: 2Gi
+                volumeMounts:
+                  - name: config
+                    mountPath: /config
+                  - name: media
+                    mountPath: /media
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8096
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8096
+                  initialDelaySeconds: 60
+                  periodSeconds: 30
+            volumes:
+              - name: config
+                persistentVolumeClaim:
+                  claimName: jellyfin-config
+              - name: media
+                persistentVolumeClaim:
+                  claimName: media-library
+
+################################################################################
+#  Service
+################################################################################
+- name: Expose Jellyfin via ClusterIP Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: jellyfin
+        namespace: media
+      spec:
+        type: ClusterIP
+        selector:
+          app: jellyfin
+        ports:
+          - name: http
+            port: 8096
+            targetPort: 8096
+            protocol: TCP
+
+################################################################################
+#  IngressRoute (Traefik v2, private only)
+################################################################################
+- name: Create Jellyfin IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: jellyfin
+        namespace: media
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        middlewares:
+          - name: whitelist-local
+            namespace: traefik
+        routes:
+          - match: "Host(`jellyfin.{{ network.private_domain }}`)"
+            kind: Rule
+            services:
+              - name: jellyfin
+                port: 8096
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: media }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: media }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: media
+    pod_selector: { app: jellyfin }
+    port: 8096
+    name_suffix: jellyfin-traefik
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: media
+    pod_selector: { app: jellyfin }
+    name_suffix: jellyfin-internet
+
+################################################################################
+#  KumaEntity (auto-registered monitor — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for jellyfin
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: jellyfin-monitor
+        namespace: media
+      spec:
+        config:
+          type: http
+          name: jellyfin
+          url: "http://jellyfin.{{ network.private_domain }}/health"
+          interval: 60
+          maxretries: 2

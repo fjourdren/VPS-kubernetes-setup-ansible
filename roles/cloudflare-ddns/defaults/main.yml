@@ -1,0 +1,23 @@
+---
+# Installation directory for cloudflare-ddns-updater
+cloudflare_ddns_install_dir: "/opt/cloudflare-ddns-updater"
+
+# Enable/disable cron job
+cloudflare_ddns_enable_cron: true
+
+# Cron schedule (default: every hour)
+cloudflare_ddns_cron_minute: "*"
+cloudflare_ddns_cron_hour: "*/1"
+cloudflare_ddns_cron_day: "*"
+cloudflare_ddns_cron_month: "*"
+cloudflare_ddns_cron_weekday: "*"
+
+# Cloudflare configuration
+# These should be overridden in your secrets.yml or playbook vars
+# cloudflare:
+#   auth_email: "your-email@example.com"
+#   auth_method: "global"  # or "token"
+#   api_token: "your-global-api-key-or-token"
+#   zone_identifier: "your-zone-id"
+#   proxy: false  # Cloudflare proxy on/off
+#   ttl: 1  # TTL in seconds, 1 = automatic

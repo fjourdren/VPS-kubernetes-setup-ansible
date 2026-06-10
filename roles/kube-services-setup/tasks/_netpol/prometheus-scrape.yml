@@ -1,0 +1,35 @@
+################################################################################
+#  NetworkPolicy helper: ingress from the monitoring namespace
+#  (Prometheus scrape — covers ServiceMonitor targets in the namespace.)
+#  Required vars:
+#    ns:           target namespace
+#    pod_selector: matchLabels dict identifying the scraped pods
+#    ports:        list of TCP ports exposing /metrics
+#  Optional vars:
+#    name_suffix:  policy name suffix (default "prometheus-scrape")
+#  Creates: <ns>-allow-<name_suffix>-ingress (or <ns>-allow-<name_suffix>)
+################################################################################
+- name: "[netpol/{{ ns }}] Prometheus scrape ingress (ports {{ ports | join(',') }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: "{{ ns }}-allow-{{ name_suffix | default('prometheus-scrape') }}"
+        namespace: "{{ ns }}"
+      spec:
+        podSelector:
+          matchLabels: "{{ pod_selector }}"
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: monitoring
+            ports: "{{ ports | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
+  # MicroK8s dqlite can transiently return "database is locked" under write bursts
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

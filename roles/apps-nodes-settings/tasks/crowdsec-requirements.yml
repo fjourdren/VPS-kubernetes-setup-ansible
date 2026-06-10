@@ -1,0 +1,20 @@
+---
+# CrowdSec requires higher inotify limits to watch log files
+# Without these, agents will fail with "too many open files" error
+- name: Set fs.inotify.max_user_watches for CrowdSec
+  become: true
+  ansible.posix.sysctl:
+    name: fs.inotify.max_user_watches
+    value: '524288'
+    state: present
+    sysctl_set: true
+    reload: true
+
+- name: Set fs.inotify.max_user_instances for CrowdSec
+  become: true
+  ansible.posix.sysctl:
+    name: fs.inotify.max_user_instances
+    value: '512'
+    state: present
+    sysctl_set: true
+    reload: true

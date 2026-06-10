@@ -1,0 +1,389 @@
+# https://docs.crowdsec.net/u/getting_started/installation/kubernetes
+# https://docs.crowdsec.net/u/bouncers/traefik/
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add CrowdSec Helm repository
+  kubernetes.core.helm_repository:
+    name: crowdsec
+    repo_url: https://crowdsecurity.github.io/helm-charts
+
+- name: Install CrowdSec via Helm
+  kubernetes.core.helm:
+    name: crowdsec
+    chart_ref: crowdsec/crowdsec
+    release_namespace: crowdsec
+    create_namespace: true
+    update_repo_cache: true
+    values:
+      image:
+        tag: "v1.7.3"
+      container_runtime: containerd
+      config:
+        # Auto-registration for agents only (bouncers cannot self-register).
+        # Allows agents coming from private IP ranges to enroll automatically.
+        config.yaml.local: |
+          api:
+            server:
+              auto_registration:
+                enabled: true
+                token: "${REGISTRATION_TOKEN}"
+                allowed_ranges:
+                  - "127.0.0.1/32"
+                  - "192.168.0.0/16"
+                  - "10.0.0.0/8"
+                  - "172.16.0.0/12"
+      lapi:
+        dashboard:
+          enabled: false
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        env:
+          - name: TZ
+            value: "Europe/Paris"
+          # API key crowdsec connected IP listing
+          - name: ENROLL_KEY
+            value: "{{  crowdsec.enroll_key }}"
+          - name: ENROLL_INSTANCE_NAME
+            value: "microk8s_homelab"
+          - name: ENROLL_TAGS
+            value: "k8s linux"
+          - name: BOUNCER_KEY_traefik
+            value: "{{ crowdsec.traefik_bouncer_key }}"
+          - name: BOUNCER_KEY_firewall
+            value: "{{ crowdsec.firewall_bouncer_key }}"
+        persistentVolume:
+          data:
+            storageClassName: nfs-runtime
+          config:
+            storageClassName: nfs-runtime
+        metrics:
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+      agent:
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        env:
+          - name: TZ
+            value: "Europe/Paris"
+          - name: COLLECTIONS
+            value: "crowdsecurity/traefik crowdsecurity/linux crowdsecurity/http-cve crowdsecurity/base-http-scenarios"
+        acquisition:
+          - namespace: traefik
+            podName: traefik-*
+            program: traefik
+        extraVolumes:
+          - name: microk8s-logs
+            hostPath:
+              path: /var/snap/microk8s/common/var/log
+              type: DirectoryOrCreate
+        extraVolumeMounts:
+          - name: microk8s-logs
+            mountPath: /var/snap/microk8s/common/var/log
+            readOnly: true
+        metrics:
+          serviceMonitor:
+            enabled: true
+            additionalLabels:
+              release: prometheus-community
+
+# The chart's `wait-for-lapi-and-register` init container runs `cscli lapi
+# register --machine <pod-name>` unconditionally on every container start.
+# When the pod sandbox restarts (e.g. node restart, OOM, disk-pressure
+# transient), the init container re-runs for the *same* pod name and LAPI
+# rejects it with "user already exist", killing the agent in
+# Init:CrashLoopBackOff. Patch the command to skip registration when the
+# credentials already exist in the EmptyDir.
+- name: Patch CrowdSec agent init container to make registration idempotent
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: strategic-merge
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: crowdsec-agent
+        namespace: crowdsec
+      spec:
+        template:
+          spec:
+            initContainers:
+              - name: wait-for-lapi-and-register
+                command:
+                  - sh
+                  - -c
+                  - |
+                    set -e
+                    until nc "$LAPI_HOST" "$LAPI_PORT" -z; do
+                      echo "waiting for lapi to start"; sleep 5
+                    done
+                    ln -sfn /staging/etc/crowdsec /etc/crowdsec
+                    if [ -f /tmp_config/local_api_credentials.yaml ]; then
+                      echo "credentials already present, restoring from /tmp_config"
+                      cp /tmp_config/local_api_credentials.yaml /etc/crowdsec/local_api_credentials.yaml
+                      exit 0
+                    fi
+                    cscli lapi register --machine "$USERNAME" -u "$LAPI_URL" --token "$REGISTRATION_TOKEN"
+                    cp /etc/crowdsec/local_api_credentials.yaml /tmp_config/local_api_credentials.yaml
+
+- name: Annotate CrowdSec LAPI StatefulSet for Velero FSB backup
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: strategic-merge
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: crowdsec-lapi
+        namespace: crowdsec
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Velero FSB: backs up the "data" volume (PVC volumeClaimTemplate
+              # data-crowdsec-lapi-0 created by the StatefulSet).
+              # Pre-hook fallback chain: sqlite3 .backup -> apk add sqlite + .backup -> cp.
+              # crowdsec image = alpine but sqlite3 not bundled -> apk branch wins.
+              # (cscli config backup was removed in 1.7.x, no usable official tool.)
+              backup.velero.io/backup-volumes: "data"
+              pre.hook.backup.velero.io/container: "crowdsec"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/var/lib/crowdsec/data/crowdsec.db; OUT=/var/lib/crowdsec/data/crowdsec.backup.db; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+
+################################################################################
+#  Firewall Bouncer (DaemonSet on each node)
+################################################################################
+# This part doesn't manage cloudflare proxied IPs, only the traefik plugin does.
+# This will manage all others services traffic (pure TCP/UDP).
+- name: Create ConfigMap for CrowdSec firewall bouncer
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: crowdsec-firewall-bouncer-config
+        namespace: "crowdsec"
+      data:
+        crowdsec-firewall-bouncer.yaml: |
+          mode: ${BACKEND}
+          update_frequency: 10s
+
+          log_mode: file
+          log_dir: /var/log/
+          log_level: info
+          log_compression: true
+          log_max_size: 100
+          log_max_backups: 3
+          log_max_age: 30
+
+          # LAPI URL (you can also keep ${API_URL} if image expects it)
+          api_url: ${API_URL}
+          api_key: ${API_KEY}
+
+          ## TLS Authentication
+          # cert_path: /etc/crowdsec/tls/cert.pem
+          # key_path: /etc/crowdsec/tls/key.pem
+          # ca_cert_path: /etc/crowdsec/tls/ca.crt
+
+          insecure_skip_verify: false
+          disable_ipv6: false
+
+          deny_action: DROP
+          deny_log: false
+
+          supported_decisions_types:
+            - ban
+
+          # to change log prefix
+          # deny_log_prefix: "crowdsec: "
+
+          # to change the blacklists name
+          blacklists_ipv4: crowdsec-blacklists
+          blacklists_ipv6: crowdsec6-blacklists
+
+          # type of ipset to use
+          ipset_type: nethash
+
+          # if present, insert rule in those chains
+          iptables_chains:
+            - INPUT
+            - FORWARD
+            # - DOCKER-USER
+
+          iptables_add_rule_comments: true
+
+          ## nftables
+          nftables:
+            ipv4:
+              enabled: true
+              set-only: false
+              table: crowdsec
+              chain: crowdsec-chain
+              priority: -10
+            ipv6:
+              enabled: true
+              set-only: false
+              table: crowdsec6
+              chain: crowdsec6-chain
+              priority: -10
+
+          nftables_hooks:
+            - input
+            - forward
+
+          # packet filter
+          pf:
+            # an empty string disables the anchor
+            anchor_name: ""
+
+          prometheus:
+            enabled: false
+            listen_addr: 127.0.0.1
+            listen_port: 60601
+
+- name: Deploy CrowdSec firewall bouncer DaemonSet
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: crowdsec-firewall-bouncer
+        namespace: "crowdsec"
+        labels:
+          app: crowdsec-firewall-bouncer
+      spec:
+        selector:
+          matchLabels:
+            app: crowdsec-firewall-bouncer
+        template:
+          metadata:
+            labels:
+              app: crowdsec-firewall-bouncer
+          spec:
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+
+            containers:
+              - name: crowdsec-firewall-bouncer
+                image: ghcr.io/shgew/cs-firewall-bouncer-docker:latest
+
+                securityContext:
+                  capabilities:
+                    add: ["NET_ADMIN", "NET_RAW"]
+                  allowPrivilegeEscalation: false
+
+                env:
+                  - name: BACKEND
+                    value: "nftables"
+                  - name: API_URL
+                    value: "http://crowdsec-service.crowdsec.svc.cluster.local:8080"
+                  - name: API_KEY
+                    value: "{{ crowdsec.firewall_bouncer_key }}"
+
+                volumeMounts:
+                  - name: config
+                    mountPath: /config/crowdsec-firewall-bouncer.yaml
+                    subPath: crowdsec-firewall-bouncer.yaml
+                    readOnly: true
+                  - name: localtime
+                    mountPath: /etc/localtime
+                    readOnly: true
+
+            volumes:
+              - name: config
+                configMap:
+                  name: crowdsec-firewall-bouncer-config
+              - name: localtime
+                hostPath:
+                  path: /etc/localtime
+                  type: File
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+#  Note: the firewall-bouncer DaemonSet uses hostNetwork; NetworkPolicies
+#  don't apply to host-network pods.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: crowdsec }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: crowdsec }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: crowdsec }
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: crowdsec }
+
+# Traefik -> CrowdSec LAPI for the bouncer plugin.
+# (No pod_selector — the chart deploys lapi without a stable label key.)
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: crowdsec
+    pod_selector: {}
+    port: 8080
+    name_suffix: lapi-traefik
+
+# CrowdSec agent -> LAPI for ban decisions / log shipping.
+- name: "[netpol/crowdsec] agent -> lapi ingress (port 8080)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: crowdsec-lapi-allow-agent-ingress
+        namespace: crowdsec
+      spec:
+        podSelector:
+          matchLabels:
+            type: lapi
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - podSelector:
+                  matchLabels:
+                    type: agent
+            ports:
+              - { protocol: TCP, port: 8080 }
+
+# Prometheus scrape — LAPI and agent share metrics port 6060.
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: crowdsec
+    pod_selector: { k8s-app: crowdsec, type: lapi }
+    ports: [6060]
+    name_suffix: lapi-prometheus-scrape
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: crowdsec
+    pod_selector: { k8s-app: crowdsec, type: agent }
+    ports: [6060]
+    name_suffix: agent-prometheus-scrape
+
+# Internet egress for threat-intel pulls and notification webhooks (LAN blocked).
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: crowdsec
+    pod_selector: { k8s-app: crowdsec, type: lapi }
+    name_suffix: lapi-web
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: crowdsec
+    pod_selector: { k8s-app: crowdsec, type: agent }
+    name_suffix: agent-web

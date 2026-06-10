@@ -1,0 +1,39 @@
+##########################################################################
+# ArgoCD
+##########################################################################
+- name: Get ArgoCD admin password secret
+  kubernetes.core.k8s_info:
+    kind: Secret
+    namespace: argocd
+    name: argocd-initial-admin-secret
+  register: argocd_admin_secret
+
+- name: Decode ArgoCD admin password
+  set_fact:
+    argocd_admin_password: "{{ argocd_admin_secret.resources[0].data.password | b64decode }}"
+  when: argocd_admin_secret.resources | length > 0
+
+- name: Print ArgoCD admin password
+  ansible.builtin.debug:
+    msg: "ArgoCD admin password is: {{ argocd_admin_password }}"
+  when: argocd_admin_secret.resources | length > 0
+
+##########################################################################
+# Grafana
+##########################################################################
+- name: Get Grafana admin password secret
+  kubernetes.core.k8s_info:
+    kind: Secret
+    namespace: monitoring
+    name: prometheus-community-grafana
+  register: grafana_admin_secret
+
+- name: Decode Grafana admin password
+  set_fact:
+    grafana_admin_password: "{{ grafana_admin_secret.resources[0].data['admin-password'] | b64decode }}"
+  when: grafana_admin_secret.resources | length > 0
+
+- name: Show Grafana password
+  ansible.builtin.debug:
+    msg: "Grafana 'admin' password: {{ grafana_admin_password }}"
+  when: grafana_admin_secret.resources | length > 0

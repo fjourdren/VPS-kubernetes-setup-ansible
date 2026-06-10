@@ -1,0 +1,9 @@
+interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+ipv4_address: 192.168.1.201
+netmask: 255.255.255.0
+gateway: 192.168.1.1
+dns_servers:
+  - 1.1.1.1
+  - 8.8.8.8
+domain: cluster.lan
+hostname: kubernetes-node01

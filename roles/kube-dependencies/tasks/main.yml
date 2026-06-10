@@ -1,0 +1,32 @@
+# Needed to run kubernetes commands from ansible
+- name: Upgrade packages
+  apt:
+    upgrade: safe
+    update_cache: yes
+    cache_valid_time: 300
+  become: true
+
+- name: Ensure CA certificates tools are present
+  apt:
+    name:
+      - ca-certificates
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Install python3 packages
+  apt:
+    name:
+      - python3
+      - python3-pip
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Install Kubernetes Python package (system package to comply with PEP 668)
+  apt:
+    name:
+      - python3-kubernetes
+    state: present
+    update_cache: yes
+  become: true

@@ -1,0 +1,30 @@
+---
+- name: Upgrade packages
+  apt:
+    upgrade: safe
+    update_cache: yes
+    cache_valid_time: 300
+
+- name: Install packages
+  apt:
+    name:
+      - aptitude
+      - curl
+      - sudo
+      - net-tools
+    state: present
+    update_cache: yes
+
+- name: Add /snap/bin to PATH for all users
+  copy:
+    dest: /etc/profile.d/10-snap-path.sh
+    mode: '0644'
+    content: |
+      export PATH="$PATH:/snap/bin"
+
+- name: Allow sudo to see /snap/bin
+  copy:
+    dest: /etc/sudoers.d/10-secure-path-snap
+    mode: '0440'
+    validate: 'visudo -cf %s'
+    content: "Defaults secure_path=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin\"\n"

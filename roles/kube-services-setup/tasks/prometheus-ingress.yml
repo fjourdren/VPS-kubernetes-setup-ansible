@@ -1,0 +1,131 @@
+################################################################################
+#  IngressRoute - Grafana (Private - HTTP & HTTPS)
+################################################################################
+- name: Create Grafana IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: grafana
+        namespace: monitoring
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`grafana.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: prometheus-community-grafana
+                port: 80
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  IngressRoute - Prometheus (Private - HTTP & HTTPS)
+################################################################################
+- name: Create Prometheus IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: prometheus
+        namespace: monitoring
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`prometheus.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: prometheus-community-kube-prometheus
+                port: 9090
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  IngressRoute - Alertmanager (Private - HTTP & HTTPS)
+################################################################################
+- name: Create Alertmanager IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: alertmanager
+        namespace: monitoring
+      spec:
+        entryPoints:
+          - web-private
+          - websecure-private
+        routes:
+          - match: Host(`alertmanager.{{ network.private_domain }}`)
+            kind: Rule
+            services:
+              - name: prometheus-community-kube-alertmanager
+                port: 9093
+            middlewares:
+              - name: whitelist-local
+                namespace: traefik
+
+################################################################################
+#  KumaEntity (auto-registered monitors — synced by AutoKuma)
+################################################################################
+- name: Register Kuma monitor for grafana
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: grafana-monitor
+        namespace: monitoring
+      spec:
+        config:
+          type: http
+          name: grafana
+          url: "http://grafana.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2
+
+- name: Register Kuma monitor for prometheus
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: prometheus-monitor
+        namespace: monitoring
+      spec:
+        config:
+          type: http
+          name: prometheus
+          url: "http://prometheus.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2
+
+- name: Register Kuma monitor for alertmanager
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: alertmanager-monitor
+        namespace: monitoring
+      spec:
+        config:
+          type: http
+          name: alertmanager
+          url: "http://alertmanager.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2

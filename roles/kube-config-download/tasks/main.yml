@@ -1,0 +1,32 @@
+- name: Ensure .kube client file exists on the control plane
+  become: true
+  file:
+    path: /var/snap/microk8s/current/credentials/client.config
+    state: file
+    mode: "0755"
+
+- name: Stat current local kubeconfig
+  delegate_to: localhost
+  become: false
+  stat:
+    path: ./kubeconfig
+  register: local_kubeconfig
+
+- name: Fetch kubeconfig from server (only when missing)
+  become: true
+  fetch:
+    src: /var/snap/microk8s/current/credentials/client.config
+    dest: ./kubeconfig
+    flat: yes
+  when: not local_kubeconfig.stat.exists
+  register: kubeconfig_fetch
+
+- name: Replace 127.0.0.1 with control-plane IP (only if needed)
+  delegate_to: localhost
+  become: false
+  replace:
+    path: ./kubeconfig
+    regexp: '127\.0\.0\.1'
+    replace: "{{ ansible_host }}"
+  when: kubeconfig_fetch.changed or
+        ('127.0.0.1' in lookup('file', './kubeconfig'))

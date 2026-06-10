@@ -1,0 +1,49 @@
+# === Storage Classes ===
+- include_tasks: hostpath-retain.yml # Host on the proxmox VM filesystem
+- include_tasks: nfs.yml    # NFS on a dedicated NAS server (here its on the proxmox host)
+
+# === Networking ===
+- include_tasks: metalb.yml
+- include_tasks: cert-manager.yml
+- include_tasks: prometheus.yml  # Install Prometheus Operator first (provides ServiceMonitor CRD)
+- include_tasks: traefik.yml     # Install Traefik second (provides IngressRoute CRD)
+- include_tasks: tailscale.yml
+
+# === Backup ===
+- include_tasks: velero.yml
+
+# === Uptime monitoring ===
+- include_tasks: kuma.yml
+
+# === Logging & Monitoring ===
+- include_tasks: prometheus-ingress.yml  # Create Prometheus IngressRoutes after Traefik is installed
+- include_tasks: crowdsec.yml
+- include_tasks: loki.yml
+- include_tasks: falco.yml
+
+# === DNS & Service Mesh ===
+- include_tasks: coredns-local.yml
+
+# === Deployment ===
+#- include_tasks: argocd.yml
+#- include_tasks: argocd-applications.yml
+
+# === Databases ===
+- include_tasks: postgresql.yml
+- include_tasks: pgadmin.yml
+- include_tasks: redis.yml
+#- include_tasks: redis-insight.yml
+
+# === Applications ===
+- include_tasks: portainer.yml
+- include_tasks: heimdall.yml
+#- include_tasks: wordpress.yml
+- include_tasks: nginx.yml # TODO : à désactiver
+- include_tasks: minecraft.yml
+- include_tasks: ghostfolio.yml
+- include_tasks: nextcloud.yml
+- include_tasks: n8n.yml
+- include_tasks: n8n-webhook-proxy.yml
+- include_tasks: jellyfin.yml
+- include_tasks: qbittorrent.yml
+- include_tasks: block-local-access.yml

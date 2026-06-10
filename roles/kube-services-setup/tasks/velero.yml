@@ -1,0 +1,401 @@
+################################################################################
+#  Velero - Backup & Restore to S3 (Scaleway Object Storage)
+#  Documentation: https://velero.io/docs
+#
+#  Architecture:
+#  - velero (Deployment, 1 pod): orchestrator, handles Backup/Restore CRDs
+#  - node-agent (DaemonSet, 1 pod per node): File System Backup via Kopia
+#  - Application pre-backup hooks: pg_dumpall, sqlite3 .backup, redis-cli SAVE
+#
+#  IMPORTANT: losing the velero-repo-credentials.repository-password secret
+#  makes the entire Kopia repository unrecoverable. Back it up twice:
+#  Ansible Vault + external password manager.
+################################################################################
+
+################################################################################
+#  Namespace
+################################################################################
+- name: Create velero namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: velero
+
+# TODO : vraiment utile ?
+################################################################################
+#  RBAC for the chart's pre-install Job hook (`velero-upgrade-crds`).
+#  The hook applies CRDs via `velero install --crds-only --apply`, which
+#  needs cluster-wide CRD perms. The chart's own ClusterRole is too
+#  narrow on some clusters and the hook fails with BackoffLimitExceeded.
+#  Pre-creating this binding makes the hook idempotent on every install.
+################################################################################
+- name: Grant cluster-admin to the Velero upgrade-crds hook ServiceAccount
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: velero-upgrade-crds-admin
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+        - kind: ServiceAccount
+          name: velero-server-upgrade-crds
+          namespace: velero
+
+################################################################################
+#  Secrets - S3 credentials (AWS-creds-file format) & Kopia repo password
+################################################################################
+- name: Create cloud-credentials secret (Scaleway S3)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: cloud-credentials
+        namespace: velero
+      type: Opaque
+      stringData:
+        cloud: |
+          [default]
+          aws_access_key_id={{ velero.s3.access_key }}
+          aws_secret_access_key={{ velero.s3.secret_key }}
+
+- name: Create velero-repo-credentials secret (Kopia repository password)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: velero-repo-credentials
+        namespace: velero
+      type: Opaque
+      stringData:
+        repository-password: "{{ velero.repo_password }}"
+
+################################################################################
+#  Helm Repository & Chart Installation
+################################################################################
+- name: Add Velero Helm repository
+  kubernetes.core.helm_repository:
+    name: vmware-tanzu
+    repo_url: https://vmware-tanzu.github.io/helm-charts
+
+- name: Install Velero via Helm
+  kubernetes.core.helm:
+    name: velero
+    chart_ref: vmware-tanzu/velero
+    chart_version: 7.2.2
+    namespace: velero
+    create_namespace: false
+    values:
+      image:
+        repository: velero/velero
+        tag: v1.14.1
+      # Bitnami moved free images to bitnamilegacy/* in Aug 2025;
+      # docker.io/bitnami/kubectl pulls now fail. Used by the
+      # upgrade-crds / cleanup-crds hook jobs.
+      kubectl:
+        image:
+          repository: docker.io/bitnamilegacy/kubectl
+          tag: "1.33.4"
+      # AWS S3 plugin (compatible with Scaleway Object Storage)
+      initContainers:
+        - name: velero-plugin-for-aws
+          image: velero/velero-plugin-for-aws:v1.10.1
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - mountPath: /target
+              name: plugins
+
+      # S3 credentials mounted from the cloud-credentials secret
+      credentials:
+        useSecret: true
+        existingSecret: cloud-credentials
+
+      # Primary BackupStorageLocation (Scaleway)
+      configuration:
+        backupStorageLocation:
+          - name: default
+            provider: aws
+            bucket: "{{ velero.s3.bucket }}"
+            default: true
+            config:
+              region: "{{ velero.s3.region }}"
+              s3ForcePathStyle: "true"   # S3-compatible non-AWS
+              s3Url: "{{ velero.s3.endpoint }}"
+        # No CSI snapshots (FSB Kopia only)
+        volumeSnapshotLocation: []
+        # Kopia uploader (default since Velero 1.13)
+        uploaderType: kopia
+        # Opt-in: only pods annotated with backup.velero.io/backup-volumes are backed up
+        defaultVolumesToFsBackup: false
+
+      # node-agent DaemonSet (required for FSB)
+      deployNodeAgent: true
+      nodeAgent:
+        # IMPORTANT: kubelet path specific to MicroK8s (see nfs.yml)
+        # Without this override, FSB reads no volume.
+        podVolumePath: /var/snap/microk8s/common/var/lib/kubelet/pods
+        privileged: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+      # Velero server resources
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+      # Prometheus metrics
+      metrics:
+        enabled: true
+        serviceMonitor:
+          enabled: true
+          additionalLabels:
+            release: prometheus-community
+        prometheusRule:
+          enabled: false   # We declare our own rules below
+
+      # Schedules declared separately (k8s CRDs) for readability
+      schedules: {}
+
+      # No aggressive garbage collector - keep the defaults
+      # backupsEnabled / snapshotsEnabled: true by default
+
+################################################################################
+#  Schedules - 2 namespace Schedules + 1 cluster-state Schedule
+#  (Velero has no native GFS - we use multiple Schedules for retention tiers)
+#
+#  Namespaces intentionally NOT included in the namespace Schedules:
+#  - tailscale: the Tailscale operator dynamically recreates a child
+#    StatefulSet (ts-vps-subnet-router-xxxx) with its own state PVC. Its loss
+#    triggers an automatic OAuth re-authentication => new machine identity
+#    + new tailnet IP => subnet routes must be re-approved once in the
+#    Tailscale admin console. Backup cost > benefit for a homelab.
+#  - kube-system, monitoring, traefik, cert-manager, metallb, falco, logging,
+#    nginx, ghostfolio, redisinsight, n8n-webhook-proxy: stateless or
+#    rebuilt by Ansible. Their data (when any) lives in a backed-up service
+#    (postgresql, redis...) or is ephemeral (emptyDir).
+#
+#  The "weekly-cluster-state" Schedule below covers cluster-scoped resources
+#  (CRDs, ClusterRoles, PVs, StorageClasses, IngressClasses, ...) so a wiped
+#  cluster can be reconstructed even before the Ansible playbook re-runs.
+################################################################################
+- name: Create nightly Velero Schedule (30 days retention)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: velero.io/v1
+      kind: Schedule
+      metadata:
+        name: nightly-full
+        namespace: velero
+      spec:
+        schedule: "0 3 * * *"
+        useOwnerReferencesInBackup: false
+        template:
+          ttl: "720h"   # 30 days
+          storageLocation: default
+          defaultVolumesToFsBackup: false   # respect annotation per-pod
+          snapshotMoveData: false
+          includedNamespaces:
+            - postgresql
+            - n8n
+            - portainer
+            - pgadmin
+            - heimdall
+            - kuma
+            - crowdsec
+            - redis
+            - minecraft
+            - wordpress
+            - nextcloud
+            - media
+          # Exclude Helm release Secrets to avoid conflicts at restore time
+          excludedResources:
+            - "secrets.helm.sh"
+
+- name: Create weekly Velero Schedule (8 weeks retention)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: velero.io/v1
+      kind: Schedule
+      metadata:
+        name: weekly-full
+        namespace: velero
+      spec:
+        schedule: "0 4 * * 0"   # Sunday 4am
+        useOwnerReferencesInBackup: false
+        template:
+          ttl: "1344h"   # 8 weeks
+          storageLocation: default
+          defaultVolumesToFsBackup: false
+          snapshotMoveData: false
+          includedNamespaces:
+            - postgresql
+            - n8n
+            - portainer
+            - pgadmin
+            - heimdall
+            - kuma
+            - crowdsec
+            - redis
+            - minecraft
+            - wordpress
+            - nextcloud
+            - media
+          excludedResources:
+            - "secrets.helm.sh"
+
+################################################################################
+#  Cluster-state Schedule
+#  - Captures cluster-scoped resources (CRDs, PVs, ClusterRoles,
+#    StorageClasses, IngressClasses...) and the "*" namespace contents,
+#    minus a few stateless ones already rebuilt by Ansible.
+#  - PVC bindings are preserved (no FSB here; PV defs only).
+#  - Useful as a single restore point after `microk8s reset` or a wipe,
+#    before the Ansible playbook re-runs.
+################################################################################
+- name: Create weekly cluster-state Velero Schedule (8 weeks retention)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: velero.io/v1
+      kind: Schedule
+      metadata:
+        name: weekly-cluster-state
+        namespace: velero
+      spec:
+        schedule: "0 6 * * 0"   # Sunday 6am (after weekly-full)
+        useOwnerReferencesInBackup: false
+        template:
+          ttl: "1344h"   # 8 weeks
+          storageLocation: default
+          # No FSB: this Schedule captures manifests + cluster-scoped
+          # resources only. Volume contents are handled by the namespace
+          # Schedules above (which run their pre-hooks).
+          defaultVolumesToFsBackup: false
+          snapshotMoveData: false
+          includeClusterResources: true
+          includedNamespaces:
+            - "*"
+          excludedNamespaces:
+            - tailscale
+          excludedResources:
+            - "secrets.helm.sh"
+            # Pod-scoped runtime data; no value in restoring it
+            - "events"
+            - "events.events.k8s.io"
+
+################################################################################
+#  NetworkPolicy
+#  See roles/kube-services-setup/tasks/_netpol/README.md for the helpers.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: velero }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: velero }
+
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: velero }
+
+# S3 (Scaleway Object Storage) is reached over public HTTPS.
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: velero
+    name_suffix: s3
+    ports: [443]
+
+- include_tasks: _netpol/kubeapi-egress.yml
+  vars: { ns: velero }
+
+# Velero metrics endpoint is on port 8085.
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: velero
+    pod_selector: {}
+    ports: [8085]
+
+################################################################################
+#  PrometheusRule (alerting backups)
+################################################################################
+- name: Create Velero PrometheusRule
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: PrometheusRule
+      metadata:
+        name: velero-rules
+        namespace: velero
+        labels:
+          release: prometheus-community
+      spec:
+        groups:
+          - name: velero.rules
+            rules:
+              - alert: VeleroBackupFailure
+                expr: increase(velero_backup_failure_total[1h]) > 0
+                for: 5m
+                labels:
+                  context: velero
+                  severity: critical
+                annotations:
+                  summary: "Velero backup failed"
+                  description: "At least one Velero backup failed in the last hour."
+
+              - alert: VeleroBackupPartialFailure
+                expr: increase(velero_backup_partial_failure_total[24h]) > 0
+                for: 10m
+                labels:
+                  context: velero
+                  severity: warning
+                annotations:
+                  summary: "Velero backup partial failure"
+                  description: "At least one Velero backup is in partial failure over 24h."
+
+              - alert: VeleroNoSuccessfulBackup24h
+                expr: time() - velero_backup_last_successful_timestamp{schedule="nightly-full"} > 90000
+                for: 10m
+                labels:
+                  context: velero
+                  severity: critical
+                annotations:
+                  summary: "No successful Velero nightly backup in 25h"
+                  description: "The nightly-full Schedule has not produced a successful backup in more than 25h."
+
+################################################################################
+#  ConfigMap (Grafana Dashboard)
+################################################################################
+- name: Create Grafana Velero dashboard
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: velero-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        velero-dashboard.json: "{{ lookup('file', 'files/velero-dashboard.json') | string }}"

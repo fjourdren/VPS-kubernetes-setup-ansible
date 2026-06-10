@@ -1,0 +1,571 @@
+################################################################################
+#  1. KumaEntity CRD
+#  Source: https://github.com/BigBoot/AutoKuma/blob/master/autokuma/kubernetes/crds-autokuma.yml
+################################################################################
+- name: Install KumaEntity CRD
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apiextensions.k8s.io/v1
+      kind: CustomResourceDefinition
+      metadata:
+        name: kumaentities.autokuma.bigboot.dev
+      spec:
+        group: autokuma.bigboot.dev
+        names:
+          kind: KumaEntity
+          plural: kumaentities
+          singular: kumaentity
+        scope: Namespaced
+        versions:
+          - name: v1
+            served: true
+            storage: true
+            schema:
+              openAPIV3Schema:
+                type: object
+                required: [spec]
+                properties:
+                  spec:
+                    type: object
+                    required: [config]
+                    properties:
+                      config:
+                        type: object
+                        additionalProperties: true
+
+
+################################################################################
+#  2. Namespace + PVCs
+################################################################################
+- name: Create kuma namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: kuma
+
+- name: Create uptime-kuma PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: uptime-kuma-pvc
+        namespace: kuma
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: nfs-important-retain
+
+# AutoKuma persists its KumaEntity -> monitor-id mapping in /data/autokuma.db.
+- name: Create autokuma PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: autokuma-pvc
+        namespace: kuma
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 100Mi
+        storageClassName: nfs-important-retain
+
+
+################################################################################
+#  3. Uptime Kuma
+################################################################################
+- name: Deploy Uptime Kuma
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: uptime-kuma
+        namespace: kuma
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: uptime-kuma
+        template:
+          metadata:
+            labels:
+              app: uptime-kuma
+            annotations:
+              backup.velero.io/backup-volumes: "data"
+              pre.hook.backup.velero.io/container: "uptime-kuma"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/app/data/kuma.db; OUT=/app/data/kuma.backup.db; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/timeout: "5m"
+          spec:
+            # coredns-local resolves *.{{ network.private_domain }} and forwards everything else upstream.
+            dnsPolicy: None
+            dnsConfig:
+              nameservers:
+                - "{{ network.private_address }}"
+              options:
+                - { name: ndots, value: "1" }
+            containers:
+              - name: uptime-kuma
+                image: louislam/uptime-kuma:1
+                ports:
+                  - containerPort: 3001
+                resources:
+                  requests: { cpu: 50m, memory: 128Mi }
+                  limits:   { cpu: 500m, memory: 256Mi }
+                volumeMounts:
+                  - { name: data, mountPath: /app/data }
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: uptime-kuma-pvc
+
+- name: Create Uptime Kuma Service (web UI on :80, app on :3001)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: uptime-kuma
+        namespace: kuma
+      spec:
+        selector:
+          app: uptime-kuma
+        ports:
+          - { name: http, port: 80, targetPort: 3001, protocol: TCP }
+
+- name: Create Uptime Kuma IngressRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: uptime-kuma
+        namespace: kuma
+      spec:
+        entryPoints: [web-private, websecure-private]
+        middlewares:
+          - { name: whitelist-local, namespace: traefik }
+        routes:
+          - match: "Host(`kuma.{{ network.private_domain }}`)"
+            kind: Rule
+            services:
+              - { name: uptime-kuma, port: 80 }
+
+
+################################################################################
+#  4. Prometheus integration
+#  /metrics requires HTTP basic auth; reuses the admin credentials.
+################################################################################
+- name: Create Uptime Kuma metrics basic-auth Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: uptime-kuma-metrics-auth
+        namespace: kuma
+      type: Opaque
+      stringData:
+        username: "{{ kuma.username }}"
+        password: "{{ kuma.password }}"
+
+- name: Create Uptime Kuma metrics Service (port 3001)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: uptime-kuma-metrics
+        namespace: kuma
+        labels:
+          app: uptime-kuma
+      spec:
+        selector:
+          app: uptime-kuma
+        ports:
+          - { name: metrics, port: 3001, targetPort: 3001, protocol: TCP }
+
+- name: Create Uptime Kuma ServiceMonitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: ServiceMonitor
+      metadata:
+        name: uptime-kuma
+        namespace: kuma
+        labels:
+          release: prometheus-community
+      spec:
+        selector:
+          matchLabels:
+            app: uptime-kuma
+        namespaceSelector:
+          matchNames: [kuma]
+        endpoints:
+          - port: metrics
+            path: /metrics
+            interval: 60s
+            basicAuth:
+              username: { name: uptime-kuma-metrics-auth, key: username }
+              password: { name: uptime-kuma-metrics-auth, key: password }
+
+- name: Create Uptime Kuma Grafana dashboard ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: uptime-kuma-dashboard
+        namespace: monitoring
+        labels:
+          grafana_dashboard: "1"
+      data:
+        uptime-kuma-dashboard.json: "{{ lookup('file', 'files/uptime-kuma-dashboard.json') | string }}"
+
+
+################################################################################
+#  5. AutoKuma credentials Secret
+################################################################################
+- name: Create autokuma credentials Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: autokuma-credentials
+        namespace: kuma
+      type: Opaque
+      stringData:
+        AUTOKUMA__KUMA__USERNAME: "{{ kuma.username }}"
+        AUTOKUMA__KUMA__PASSWORD: "{{ kuma.password }}"
+
+
+################################################################################
+#  6. Admin bootstrap Job
+#  Seeds the admin user on first run and keeps the password hash aligned with vault.yml.
+################################################################################
+- name: Delete previous bootstrap Job (Pod template is immutable across runs)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    namespace: kuma
+    name: uptime-kuma-bootstrap
+    wait: true
+    wait_timeout: 60
+    delete_options:
+      propagationPolicy: Background
+
+- name: Run Uptime Kuma admin bootstrap Job
+  register: _kuma_bootstrap
+  kubernetes.core.k8s:
+    state: present
+    wait: true
+    wait_condition: { type: Complete, status: "True" }
+    wait_timeout: 300
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: uptime-kuma-bootstrap
+        namespace: kuma
+      spec:
+        backoffLimit: 5
+        ttlSecondsAfterFinished: 600
+        template:
+          spec:
+            restartPolicy: OnFailure
+            containers:
+              - name: bootstrap
+                image: louislam/uptime-kuma:1
+                workingDir: /app
+                envFrom:
+                  - secretRef:
+                      name: autokuma-credentials
+                volumeMounts:
+                  - { name: data, mountPath: /app/data }
+                command: ["sh", "-c"]
+                args:
+                  - |
+                    set -eu
+                    DB=/app/data/kuma.db
+                    # Wait until uptime-kuma has created the schema.
+                    until [ -f "$DB" ] && sqlite3 "$DB" 'SELECT 1 FROM user LIMIT 1' >/dev/null 2>&1; do
+                      sleep 2
+                    done
+                    # bcrypt salts differ per hash, so compare via verify, not string equality.
+                    if [ "$(sqlite3 "$DB" 'SELECT COUNT(*) FROM user')" -gt 0 ]; then
+                      CUR=$(sqlite3 "$DB" "SELECT password FROM user WHERE username='$AUTOKUMA__KUMA__USERNAME' LIMIT 1;")
+                      if [ -n "$CUR" ] && [ "$(node -e "console.log(require('bcryptjs').compareSync(process.env.AUTOKUMA__KUMA__PASSWORD, process.argv[1]))" "$CUR")" = "true" ]; then
+                        echo "admin password already matches vault, nothing to do"
+                        exit 0
+                      fi
+                      HASH=$(node -e 'console.log(require("bcryptjs").hashSync(process.env.AUTOKUMA__KUMA__PASSWORD, 10))')
+                      sqlite3 "$DB" "UPDATE user SET username='$AUTOKUMA__KUMA__USERNAME', password='$HASH' WHERE id=(SELECT MIN(id) FROM user);"
+                      echo "admin password realigned to vault"
+                      exit 0
+                    fi
+                    HASH=$(node -e 'console.log(require("bcryptjs").hashSync(process.env.AUTOKUMA__KUMA__PASSWORD, 10))')
+                    sqlite3 "$DB" "INSERT INTO user (username, password) VALUES ('$AUTOKUMA__KUMA__USERNAME', '$HASH');"
+                    echo "admin created: $AUTOKUMA__KUMA__USERNAME"
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: uptime-kuma-pvc
+
+# Uptime Kuma caches `needSetup` in memory at boot, so a pod that started
+# before the bootstrap Job inserted the admin user keeps redirecting clients
+# to /setup forever. Bounce it once the Job has completed.
+- name: Restart uptime-kuma so it re-reads the user table
+  kubernetes.core.k8s:
+    state: patched
+    api_version: apps/v1
+    kind: Deployment
+    namespace: kuma
+    name: uptime-kuma
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kuma.bootstrap/restartedAt: "{{ ansible_date_time.iso8601 }}"
+  when: _kuma_bootstrap.changed
+
+
+################################################################################
+#  7. AutoKuma — RBAC + Deployment
+#  kube-rs's finalizer() helper adds/removes a finalizer on each reconcile,
+#  so the ClusterRole needs patch/update on KumaEntity.
+################################################################################
+- name: Create autokuma ServiceAccount
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: autokuma
+        namespace: kuma
+
+- name: Create autokuma ClusterRole
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: autokuma
+      rules:
+        - apiGroups: ["autokuma.bigboot.dev"]
+          resources: ["kumaentities"]
+          verbs: ["get", "list", "watch", "patch", "update"]
+
+- name: Create autokuma ClusterRoleBinding
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: autokuma
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: autokuma
+      subjects:
+        - { kind: ServiceAccount, name: autokuma, namespace: kuma }
+
+- name: Deploy AutoKuma controller
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: autokuma
+        namespace: kuma
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: autokuma
+        template:
+          metadata:
+            labels:
+              app: autokuma
+            annotations:
+              backup.velero.io/backup-volumes: "data"
+          spec:
+            serviceAccountName: autokuma
+            containers:
+              - name: autokuma
+                image: ghcr.io/bigboot/autokuma:uptime-kuma-v1-latest
+                resources:
+                  requests: { cpu: 20m,  memory: 32Mi }
+                  limits:   { cpu: 100m, memory: 128Mi }
+                env:
+                  - { name: AUTOKUMA__KUMA__URL,         value: "http://uptime-kuma.kuma.svc.cluster.local" }
+                  - { name: AUTOKUMA__KUBERNETES__ENABLED, value: "true" }
+                  - { name: AUTOKUMA__DOCKER__ENABLED,   value: "false" }
+                  - { name: AUTOKUMA__TAG_NAME,          value: "autokuma" }
+                  - { name: AUTOKUMA__TAG_COLOR,         value: "#42C0FB" }
+                envFrom:
+                  - secretRef:
+                      name: autokuma-credentials
+                volumeMounts:
+                  - { name: data, mountPath: /data }
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: autokuma-pvc
+
+
+################################################################################
+#  8. NetworkPolicies — see roles/kube-services-setup/tasks/_netpol/README.md.
+################################################################################
+- include_tasks: _netpol/default-deny.yml
+  vars: { ns: kuma }
+
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: kuma }
+
+- include_tasks: _netpol/traefik-ingress.yml
+  vars:
+    ns: kuma
+    pod_selector: { app: uptime-kuma }
+    port: 3001
+
+# autokuma <-> uptime-kuma Socket.IO on 3001, and bootstrap-Job -> uptime-kuma.
+- include_tasks: _netpol/intra-namespace.yml
+  vars: { ns: kuma }
+
+- include_tasks: _netpol/prometheus-scrape.yml
+  vars:
+    ns: kuma
+    pod_selector: { app: uptime-kuma }
+    ports: [3001]
+
+# Uptime Kuma uses coredns-local for DNS; the generic dns-egress helper
+# only targets kube-system CoreDNS.
+- name: "[netpol/kuma] uptime-kuma DNS egress to coredns-local"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: kuma-allow-uptime-kuma-coredns-local-egress
+        namespace: kuma
+      spec:
+        podSelector:
+          matchLabels:
+            app: uptime-kuma
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: dns-system
+                podSelector:
+                  matchLabels:
+                    app: coredns-local
+            ports:
+              - { protocol: UDP, port: 53 }
+              - { protocol: TCP, port: 53 }
+
+# Uptime Kuma probes the cluster and the public Internet; the LAN is blocked
+# except for the public LB IP (Minecraft TCP probe on port 25565).
+- name: "[netpol/kuma] uptime-kuma probe egress"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: kuma-allow-uptime-kuma-egress
+        namespace: kuma
+      spec:
+        podSelector:
+          matchLabels:
+            app: uptime-kuma
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+              - ipBlock:
+                  cidr: "{{ network.public_address }}/32"
+
+# AutoKuma watches KumaEntity CRs cluster-wide -> needs kube-apiserver.
+- name: "[netpol/kuma] autokuma kube-apiserver egress"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: kuma-allow-autokuma-kubeapi-egress
+        namespace: kuma
+      spec:
+        podSelector:
+          matchLabels:
+            app: autokuma
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: default
+            ports:
+              - { protocol: TCP, port: 443 }
+          - to:
+              - ipBlock:
+                  cidr: "{{ network.private_cidr }}"
+            ports:
+              - { protocol: TCP, port: 6443 }
+              - { protocol: TCP, port: 16443 }
+
+
+################################################################################
+#  9. Self-monitor KumaEntity
+################################################################################
+- name: Register Kuma self-monitor
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: autokuma.bigboot.dev/v1
+      kind: KumaEntity
+      metadata:
+        name: kuma-monitor
+        namespace: kuma
+      spec:
+        config:
+          type: http
+          name: kuma
+          url: "http://kuma.{{ network.private_domain }}"
+          interval: 60
+          maxretries: 2
