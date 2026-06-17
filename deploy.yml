@@ -16,7 +16,7 @@
     - role: istvano.microk8s
       vars:
         microk8s_version: "1.34/stable"
-        microk8s_enable_HA: true
+        microk8s_enable_HA: "{{ groups['microk8s_HA'] | length > 1 }}"
         microk8s_plugins:
           metrics-server: true
           registry: true
