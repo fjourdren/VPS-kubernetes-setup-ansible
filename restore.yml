@@ -1,0 +1,39 @@
+################################################################################
+#  On-demand Velero restore (disaster recovery)
+#
+#  Pulls data backed up by Velero (Scaleway Object Storage, Kopia repository)
+#  back into the cluster. The restore re-creates the PVCs, which provision
+#  automatically on the NFS server via the nfs-* StorageClasses, then the
+#  node-agent re-injects the volume contents from Kopia (File System Backup).
+#
+#  Parameters (pass via --extra-vars):
+#    list=true              List the available Completed backups, then stop.
+#    backup=<name|latest>   Backup to restore from (default: latest Completed).
+#    namespaces=<a,b|all>   Comma-separated namespaces, or "all".
+#    mode=<recover|inplace> recover -> restore into <ns>-recover (safe, default)
+#                           inplace -> restore into the original namespaces.
+#    confirm=true           Required for inplace to delete target namespaces first.
+#
+#  inplace also replays the SQL dumps automatically (/dump/all.sql -> PostgreSQL,
+#  /dump/wordpress.sql -> MySQL), since only the dump is backed up, not the live
+#  datadir.
+#
+#  With namespaces=all the target namespaces come from the backup's own
+#  spec.includedNamespaces: a data backup (nightly/weekly) pre-deletes + restores
+#  its namespaces; a wildcard backup (weekly-cluster-state) must be restored onto
+#  a freshly wiped cluster instead.
+#
+#  Examples:
+#    ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa -e list=true
+#    ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa \
+#      -e backup=latest -e namespaces=kuma -e mode=recover
+#    ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa \
+#      -e backup=nightly-full-<ts> -e namespaces=postgresql,nextcloud -e mode=inplace -e confirm=true
+################################################################################
+- name: On-demand Velero restore (disaster recovery)
+  hosts: microk8s_HA
+  environment: # Needed to reach the snap-provided kubeconfig / binaries
+    PATH: "{{ ansible_env.PATH | default('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin') }}:/snap/bin:/usr/sbin"
+  roles:
+    - role: velero-restore
+      run_once: true

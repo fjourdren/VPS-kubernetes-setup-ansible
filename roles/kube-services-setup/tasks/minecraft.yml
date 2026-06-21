@@ -69,13 +69,19 @@
           metadata:
             labels:
               app: minecraft
-            # Velero FSB: backs up the world data after forcing a full save.
+            # Velero FSB: backs up the world data. The pre-hook disables auto-save
+            # then flushes to disk so the region files stay frozen while Kopia reads
+            # them (otherwise the server keeps writing region files mid-backup ->
+            # torn chunks). The post-hook re-enables auto-save once FSB is done.
             # rcon-cli reads RCON_PASSWORD/RCON_PORT from env (set below).
             annotations:
               backup.velero.io/backup-volumes: "data"
               pre.hook.backup.velero.io/container: "minecraft"
-              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'rcon-cli save-all flush'] | to_json }}"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'rcon-cli save-off && rcon-cli save-all flush'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
+              post.hook.backup.velero.io/container: "minecraft"
+              post.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'rcon-cli save-on'] | to_json }}"
+              post.hook.backup.velero.io/timeout: "5m"
           spec:
             securityContext:
               fsGroup: 1000

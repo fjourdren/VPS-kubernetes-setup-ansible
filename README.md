@@ -1529,7 +1529,47 @@ velero backup describe test-kuma --details
 velero backup logs test-kuma | grep -iE 'hook|sqlite|pg_dump'
 ```
 
-#### Restore runbook
+#### Restore with `restore.yml` (recommended)
+
+On-demand disaster recovery playbook. It pulls data backed up by Velero (Scaleway /
+Kopia) back into the cluster by creating a Velero `Restore`: the PVCs are re-created and
+provision automatically on the NFS server, then the node-agent restores the volume
+contents from Kopia. It drives Velero through the `kubernetes.core` modules, so no
+`velero` CLI is required on the node.
+
+**Parameters** (`--extra-vars`):
+
+| Var          | Default   | Description |
+|--------------|-----------|-------------|
+| `list`       | `false`   | `true` → list the available `Completed` backups, then stop. |
+| `backup`     | `latest`  | Backup name, or `latest` (most recent `Completed`). |
+| `namespaces` | *(required)* | Comma-separated namespaces (`nextcloud,postgresql`), or `all`. |
+| `mode`       | `recover` | `recover` → restore into `<ns>-recover` (safe); `inplace` → original namespaces. |
+| `confirm`    | `false`   | Required for `inplace`: deletes the target namespaces first (Velero never overwrites existing PVCs). |
+
+```bash
+# List the available backups
+ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa -e list=true
+
+# Safe restore of one namespace into kuma-recover (inspect, then switch over manually)
+ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa \
+  -e backup=latest -e namespaces=kuma -e mode=recover
+kubectl -n kuma-recover get pods,pvc
+
+# Full in-place disaster recovery from a chosen backup
+ansible-playbook restore.yml -i hosts --key-file ~/.ssh/id_rsa \
+  -e backup=nightly-full-<timestamp> -e namespaces=all -e mode=inplace -e confirm=true
+```
+
+> ℹ️ `recover` mode never touches production — data lands in `<ns>-recover` for inspection (it requires explicit namespaces, not `all`).
+
+> ℹ️ With `namespaces=all` the targets come from the backup's `spec.includedNamespaces`: a data backup (`nightly-full`/`weekly-full`) pre-deletes + restores its namespaces (system namespaces are never deleted); a wildcard backup (`weekly-cluster-state`) must be restored onto a wiped cluster.
+
+> ℹ️ Only the SQL dump is backed up, never the live datadir, so `inplace` replays `/dump/all.sql` (PostgreSQL) and `/dump/wordpress.sql` (MySQL) automatically. Re-run `deploy.yml` afterwards to reconverge Ansible-managed resources.
+
+#### Restore runbook (manual `velero` commands)
+
+The commands below remain valid for ad-hoc control or when you want finer-grained steps than `restore.yml` offers.
 
 **Restore a whole namespace (normal case)**
 ```bash

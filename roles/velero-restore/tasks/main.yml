@@ -1,0 +1,285 @@
+################################################################################
+#  velero-restore - On-demand Velero restore (disaster recovery)
+#
+#  Re-injects data backed up by Velero (Scaleway / Kopia) back into the cluster
+#  by creating a velero.io/v1 Restore CRD. The restore re-creates the PVCs,
+#  which provision on the NFS server via the nfs-* StorageClasses, and the
+#  node-agent restores the volume contents from Kopia (File System Backup).
+################################################################################
+
+- name: Fetch Velero backups
+  kubernetes.core.k8s_info:
+    api_version: velero.io/v1
+    kind: Backup
+    namespace: velero
+  register: velero_backups
+
+################################################################################
+#  List mode - show the available Completed backups and stop
+################################################################################
+- name: Show available Completed backups (oldest first, newest last)
+  ansible.builtin.debug:
+    msg: "{{ item.metadata.name }}  [{{ item.status.completionTimestamp | default('?') }}]"
+  loop: >-
+    {{ velero_backups.resources
+       | selectattr('status.phase', 'defined')
+       | selectattr('status.phase', 'equalto', 'Completed')
+       | sort(attribute='status.completionTimestamp')
+       | list }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: list | bool
+
+- name: Stop after listing
+  ansible.builtin.meta: end_play
+  when: list | bool
+
+################################################################################
+#  Validate parameters
+################################################################################
+- name: Validate parameters
+  ansible.builtin.assert:
+    that:
+      - mode in ['recover', 'inplace']
+      - namespaces | length > 0
+      - not (mode == 'recover' and namespaces == 'all')
+    fail_msg: >-
+      Invalid parameters. Required: namespaces=<a,b|all>; mode in [recover, inplace].
+      recover mode cannot be combined with namespaces=all (it needs explicit
+      namespaces to build the <ns>-recover mapping).
+
+################################################################################
+#  Resolve the backup to restore from
+################################################################################
+- name: Ensure at least one Completed backup exists (latest mode)
+  ansible.builtin.assert:
+    that:
+      - completed_backups | length > 0
+    fail_msg: "No Completed Velero backup found to restore from."
+  vars:
+    completed_backups: >-
+      {{ velero_backups.resources
+         | selectattr('status.phase', 'defined')
+         | selectattr('status.phase', 'equalto', 'Completed')
+         | list }}
+  when: backup == 'latest'
+
+- name: Resolve the latest Completed backup
+  ansible.builtin.set_fact:
+    backup_name: >-
+      {{ velero_backups.resources
+         | selectattr('status.phase', 'defined')
+         | selectattr('status.phase', 'equalto', 'Completed')
+         | sort(attribute='status.completionTimestamp')
+         | map(attribute='metadata.name')
+         | list | last }}
+  when: backup == 'latest'
+
+- name: Use the explicitly requested backup
+  ansible.builtin.set_fact:
+    backup_name: "{{ backup }}"
+  when: backup != 'latest'
+
+- name: Verify the resolved backup exists and is Completed
+  ansible.builtin.assert:
+    that:
+      - matching | length == 1
+      - matching[0].status.phase | default('') == 'Completed'
+    fail_msg: "Backup '{{ backup_name }}' not found or not in Completed phase."
+  vars:
+    matching: "{{ velero_backups.resources | selectattr('metadata.name', 'equalto', backup_name) | list }}"
+
+################################################################################
+#  Build the restore targets
+#
+#  When namespaces=all we resolve the concrete namespace set from the backup's
+#  own spec.includedNamespaces (schedule-created backups record it). This is
+#  what lets an in-place "all" restore actually pre-delete the right namespaces
+#  so Velero re-creates their PVCs — without it, Velero never overwrites an
+#  existing PVC and the volume data is silently skipped.
+################################################################################
+- name: Resolve the namespaces recorded in the chosen backup
+  ansible.builtin.set_fact:
+    backup_included_namespaces: >-
+      {{ (velero_backups.resources
+          | selectattr('metadata.name', 'equalto', backup_name)
+          | list | first).spec.includedNamespaces | default(['*']) }}
+
+- name: Build the namespace list
+  ansible.builtin.set_fact:
+    ns_list: >-
+      {{ backup_included_namespaces
+         if namespaces == 'all'
+         else (namespaces.split(',') | map('trim') | select | list) }}
+
+- name: Build the namespace mapping (recover mode)
+  ansible.builtin.set_fact:
+    namespace_mapping: >-
+      {{ dict(ns_list | zip(ns_list | map('regex_replace', '$', '-recover') | list)) }}
+  when: mode == 'recover'
+
+################################################################################
+#  In-place only: wipe the target namespaces first so Velero re-creates the
+#  PVCs (Velero never overwrites existing volumes). Gated behind confirm=true.
+#
+#  Protected namespaces are never deleted. A wildcard ('*') backup (e.g.
+#  weekly-cluster-state) cannot be pre-deleted safely — it is restored as-is
+#  and only re-hydrates namespaces that do NOT already exist (i.e. a freshly
+#  wiped cluster); a loud warning is emitted instead of silently doing nothing.
+################################################################################
+- name: Warn that a wildcard backup cannot be pre-deleted in-place
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: backup '{{ backup_name }}' targets all namespaces ('*'). In-place
+      restore will NOT pre-delete namespaces, so volume data is only restored for
+      namespaces that do not already exist (a wiped cluster). On a live cluster,
+      existing PVCs are left untouched. Use a data backup (nightly-full/weekly-full)
+      with an explicit namespaces=<a,b,...> list to force an in-place data restore.
+  when:
+    - mode == 'inplace'
+    - "'*' in ns_list"
+
+- name: Delete target namespaces before in-place restore (confirmed)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+    wait: true
+    wait_timeout: 300
+  loop: "{{ ns_list | difference(protected_namespaces) }}"
+  vars:
+    protected_namespaces:
+      - velero
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - default
+  when:
+    - mode == 'inplace'
+    - confirm | bool
+    - "'*' not in ns_list"
+
+################################################################################
+#  Create the Restore and wait for completion
+################################################################################
+- name: Create the Velero Restore
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: velero.io/v1
+      kind: Restore
+      metadata:
+        name: "restore-{{ backup_name }}-{{ ansible_date_time.epoch }}"
+        namespace: velero
+      spec: >-
+        {{
+          {'backupName': backup_name, 'existingResourcePolicy': 'update'}
+          | combine({'includedNamespaces': ns_list} if namespaces != 'all' else {})
+          | combine({'namespaceMapping': namespace_mapping} if mode == 'recover' else {})
+        }}
+  register: created_restore
+
+- name: Wait for the restore to finish
+  kubernetes.core.k8s_info:
+    api_version: velero.io/v1
+    kind: Restore
+    namespace: velero
+    name: "{{ created_restore.result.metadata.name }}"
+  register: restore_status
+  until: >-
+    restore_status.resources | length > 0
+    and (restore_status.resources[0].status.phase | default('')
+         in ['Completed', 'PartiallyFailed', 'Failed', 'FailedValidation'])
+  retries: 60
+  delay: 15
+
+################################################################################
+#  Optional SQL replay (in-place only)
+#
+#  PostgreSQL/MySQL only back up a logical dump (all.sql / wordpress.sql), never
+#  the live datadir, so a fresh restore comes up with an EMPTY database until the
+#  dump is replayed. In-place restores replay it automatically once the DB pod is
+#  Ready. Uses the pod's own credentials env (no secrets needed here). Errors on
+#  already-existing roles/objects are non-fatal.
+################################################################################
+- name: Wait for PostgreSQL to be Ready before replaying the dump
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: postgresql
+    label_selectors: ["app.kubernetes.io/name=postgresql"]
+  register: _pg_pod
+  until: >-
+    (_pg_pod.resources | default([])) | length > 0 and
+    ((_pg_pod.resources[0].status.conditions | default([])
+      | selectattr('type', 'equalto', 'Ready')
+      | map(attribute='status') | list | first | default('False')) == 'True')
+  retries: 40
+  delay: 15
+  when:
+    - mode == 'inplace'
+    - "'postgresql' in ns_list"
+
+- name: Replay pg_dumpall into PostgreSQL
+  ansible.builtin.command:
+    argv:
+      - microk8s
+      - kubectl
+      - exec
+      - -n
+      - postgresql
+      - sts/postgresql
+      - --
+      - sh
+      - -c
+      - 'PGPASSWORD="$(cat $POSTGRES_PASSWORD_FILE)" psql -U postgres -h 127.0.0.1 -f /dump/all.sql'
+  register: _pg_replay
+  changed_when: true
+  failed_when: _pg_replay.rc != 0
+  when:
+    - mode == 'inplace'
+    - "'postgresql' in ns_list"
+
+- name: Replay mysqldump into MySQL (WordPress)
+  ansible.builtin.command:
+    argv:
+      - microk8s
+      - kubectl
+      - exec
+      - -n
+      - wordpress
+      - deploy/mysql
+      - --
+      - sh
+      - -c
+      - 'mysql -u "$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" < /dump/wordpress.sql'
+  register: _mysql_replay
+  changed_when: true
+  failed_when: _mysql_replay.rc != 0
+  when:
+    - mode == 'inplace'
+    - "'wordpress' in ns_list"
+
+################################################################################
+#  Report
+################################################################################
+- name: Report restore outcome
+  ansible.builtin.debug:
+    msg:
+      - "Restore:  {{ restore_status.resources[0].metadata.name }}"
+      - "Backup:   {{ backup_name }}"
+      - "Mode:     {{ mode }}{{ ' (namespaces -> *-recover)' if mode == 'recover' else '' }}"
+      - "Targets:  {{ ns_list | join(', ') }}"
+      - "Phase:    {{ restore_status.resources[0].status.phase }}"
+      - "SQL replay: {{ 'yes' if mode == 'inplace' else 'no (recover mode — replay /dump/*.sql manually if needed)' }}"
+      - "Warnings: {{ restore_status.resources[0].status.warnings | default(0) }} / Errors: {{ restore_status.resources[0].status.errors | default(0) }}"
+
+- name: Hint on how to inspect an incomplete restore
+  ansible.builtin.debug:
+    msg: >-
+      Restore did not fully complete. Inspect with:
+      `kubectl -n velero describe restore {{ restore_status.resources[0].metadata.name }}`,
+      `kubectl -n velero get podvolumerestore`,
+      `kubectl -n velero logs deploy/velero`.
+  when: restore_status.resources[0].status.phase != 'Completed'

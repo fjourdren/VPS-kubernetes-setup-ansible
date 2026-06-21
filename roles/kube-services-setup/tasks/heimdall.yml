@@ -91,6 +91,13 @@
               pre.hook.backup.velero.io/container: "heimdall"
               pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/config/www/app.sqlite; OUT=/config/www/app.backup.sqlite; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
+              # Velero restore hook: before Heimdall starts, swap the consistent
+              # sqlite snapshot over the live DB (the live file FSB captured may
+              # be mid-write / WAL-inconsistent). No-op when the snapshot is absent.
+              init.hook.restore.velero.io/container-image: "busybox:1.37"
+              init.hook.restore.velero.io/container-name: "restore-db-swap"
+              init.hook.restore.velero.io/command: "{{ ['/bin/sh', '-c', 'D=/config/www/app.sqlite; B=/config/www/app.backup.sqlite; if [ -f \"$B\" ]; then mv -f \"$B\" \"$D\"; rm -f \"$D-wal\" \"$D-shm\"; fi'] | to_json }}"
+              init.hook.restore.velero.io/timeout: "2m"
           spec:
             containers:
               - name: heimdall

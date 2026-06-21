@@ -149,7 +149,7 @@
             annotations:
               backup.velero.io/backup-volumes: "dump"
               pre.hook.backup.velero.io/container: "postgresql"
-              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'PGPASSWORD=$POSTGRES_PASSWORD pg_dumpall -U ' ~ postgresql.username ~ ' -h 127.0.0.1 > /dump/all.sql'] | to_json }}"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'PGPASSWORD=\"$(cat $POSTGRES_PASSWORD_FILE)\" pg_dumpall -U ' ~ postgresql.username ~ ' -h 127.0.0.1 > /dump/all.sql'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "10m"
 
 ################################################################################

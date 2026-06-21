@@ -109,6 +109,12 @@
               pre.hook.backup.velero.io/container: "uptime-kuma"
               pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/app/data/kuma.db; OUT=/app/data/kuma.backup.db; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
+              # Velero restore hook: swap the consistent snapshot over the live DB
+              # before uptime-kuma starts. No-op when the snapshot is absent.
+              init.hook.restore.velero.io/container-image: "busybox:1.37"
+              init.hook.restore.velero.io/container-name: "restore-db-swap"
+              init.hook.restore.velero.io/command: "{{ ['/bin/sh', '-c', 'D=/app/data/kuma.db; B=/app/data/kuma.backup.db; if [ -f \"$B\" ]; then mv -f \"$B\" \"$D\"; rm -f \"$D-wal\" \"$D-shm\"; fi'] | to_json }}"
+              init.hook.restore.velero.io/timeout: "2m"
           spec:
             # coredns-local resolves *.{{ network.private_domain }} and forwards everything else upstream.
             dnsPolicy: None

@@ -63,7 +63,7 @@
             annotations:
               backup.velero.io/backup-volumes: "redis-data"
               pre.hook.backup.velero.io/container: "redis"
-              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning SAVE'] | to_json }}"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'redis-cli -a \"$(cat $REDIS_PASSWORD_FILE)\" --no-auth-warning BGSAVE; until redis-cli -a \"$(cat $REDIS_PASSWORD_FILE)\" --no-auth-warning INFO persistence | grep -q \"rdb_bgsave_in_progress:0\"; do sleep 1; done'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
 
 ################################################################################

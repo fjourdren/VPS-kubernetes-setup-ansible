@@ -85,22 +85,43 @@
             labels:
               app: jellyfin
             annotations:
-              # Velero FSB: backs up the config PVC. SQLite consistency hook
-              # mirrors the heimdall.yml pattern (sqlite3 .backup -> apk add ->
-              # cp fallback). The lscr.io/linuxserver/jellyfin image is
-              # Ubuntu-based (no apk) so the chain falls through to `cp`,
-              # which is acceptable: Jellyfin uses SQLite WAL and the DB is
-              # self-recoverable on next open. Media files (the shared
-              # `media-library` PVC mounted at /media) are NOT in this volume
+              # Velero FSB: backs up the config PVC. The lscr.io/linuxserver/jellyfin
+              # image is Ubuntu-based with no sqlite3 CLI, so a consistent snapshot
+              # is taken by a dedicated `sqlite-backup` sidecar (see below) rather
+              # than a fragile `cp` of the live WAL DB. On restore the snapshot is
+              # swapped over the live DB by an init restore hook. Media files (the
+              # shared `media-library` PVC mounted at /media) are NOT in this volume
               # and are intentionally not backed up.
               backup.velero.io/backup-volumes: "config"
-              pre.hook.backup.velero.io/container: "jellyfin"
-              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/config/data/jellyfin.db; OUT=/config/data/jellyfin.backup.db; if [ ! -f \"$DB\" ]; then exit 0; fi; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/container: "sqlite-backup"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/config/data/jellyfin.db; OUT=/config/data/jellyfin.backup.db; if [ -f \"$DB\" ]; then sqlite3 \"$DB\" \".backup $OUT\" && chown 1000:1000 \"$OUT\"; fi'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
+              # Velero restore hook: swap the consistent snapshot over the live DB
+              # before Jellyfin starts. No-op when the snapshot is absent.
+              init.hook.restore.velero.io/container-image: "busybox:1.37"
+              init.hook.restore.velero.io/container-name: "restore-db-swap"
+              init.hook.restore.velero.io/command: "{{ ['/bin/sh', '-c', 'D=/config/data/jellyfin.db; B=/config/data/jellyfin.backup.db; if [ -f \"$B\" ]; then mv -f \"$B\" \"$D\"; rm -f \"$D-wal\" \"$D-shm\"; fi'] | to_json }}"
+              init.hook.restore.velero.io/timeout: "2m"
           spec:
             securityContext:
               fsGroup: 1000
             containers:
+              # Sidecar providing the sqlite3 CLI so the Velero pre-hook can take a
+              # consistent `.backup` snapshot of jellyfin.db (the Jellyfin image has
+              # no sqlite3). Runs as root to read/chown the config files; idles
+              # otherwise (~10m/16Mi). sqlite is pulled once at start over the
+              # existing web egress (apk; ports 80/443).
+              - name: sqlite-backup
+                image: alpine:3.20
+                command: ["/bin/sh", "-c", "apk add --no-cache sqlite >/dev/null 2>&1 || true; exec sleep infinity"]
+                securityContext:
+                  runAsUser: 0
+                resources:
+                  requests: { cpu: 10m, memory: 16Mi }
+                  limits: { cpu: 100m, memory: 64Mi }
+                volumeMounts:
+                  - name: config
+                    mountPath: /config
               - name: jellyfin
                 image: lscr.io/linuxserver/jellyfin:latest
                 env:

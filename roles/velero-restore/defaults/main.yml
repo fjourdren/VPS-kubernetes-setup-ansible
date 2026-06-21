@@ -1,0 +1,7 @@
+---
+# See restore.yml for the full parameter documentation.
+list: false          # true -> only list the available Completed backups
+backup: latest       # backup name, or "latest" (most recent Completed)
+namespaces: ""       # comma-separated namespaces, or "all" (required unless list=true)
+mode: recover        # recover -> <ns>-recover (safe) | inplace -> original namespaces
+confirm: false       # required for inplace to delete target namespaces first

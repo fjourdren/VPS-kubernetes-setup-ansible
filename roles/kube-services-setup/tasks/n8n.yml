@@ -50,21 +50,43 @@
             labels:
               app: n8n
             annotations:
-              # Velero: backs up the n8n-data PVC via FSB (Kopia).
+              # Velero: backs up the n8n-data PVC via FSB (Kopia). n8n runs as uid
+              # 1000 with no sqlite3 CLI, so a consistent snapshot of database.sqlite
+              # is taken by a dedicated `sqlite-backup` sidecar (see below) instead
+              # of a fragile `cp` of the live WAL DB. On restore the snapshot is
+              # swapped over the live DB by an init restore hook.
               backup.velero.io/backup-volumes: "n8n-data"
-              # Pre-hook fallback chain: n8n CLI export -> sqlite3 .backup -> apk add sqlite
-              # + .backup -> cp. n8n hardened image: no sqlite3 CLI, no apk, runs as uid 1000
-              # -> n8n branch wins. Restore = n8n import:workflow / import:credentials from
-              # /home/node/.n8n/backup/.
-              pre.hook.backup.velero.io/container: "n8n"
-              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/home/node/.n8n/database.sqlite; OUT=/home/node/.n8n/database.backup.sqlite; BAK=/home/node/.n8n/backup; if command -v n8n >/dev/null 2>&1; then rm -rf \"$BAK\" && mkdir -p \"$BAK/workflows\" \"$BAK/credentials\" && n8n export:workflow --all --backup --output=\"$BAK/workflows/\" && n8n export:credentials --all --backup --output=\"$BAK/credentials/\"; elif command -v sqlite3 >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; elif command -v apk >/dev/null 2>&1 && apk add --no-cache sqlite >/dev/null 2>&1; then sqlite3 \"$DB\" \".backup $OUT\"; else cp \"$DB\" \"$OUT\"; fi'] | to_json }}"
+              pre.hook.backup.velero.io/container: "sqlite-backup"
+              pre.hook.backup.velero.io/command: "{{ ['/bin/sh', '-c', 'DB=/home/node/.n8n/database.sqlite; OUT=/home/node/.n8n/database.backup.sqlite; if [ -f \"$DB\" ]; then sqlite3 \"$DB\" \".backup $OUT\" && chown 1000:1000 \"$OUT\"; fi'] | to_json }}"
               pre.hook.backup.velero.io/timeout: "5m"
+              # Velero restore hook: swap the consistent snapshot over the live DB
+              # before n8n starts. No-op when the snapshot is absent.
+              init.hook.restore.velero.io/container-image: "busybox:1.37"
+              init.hook.restore.velero.io/container-name: "restore-db-swap"
+              init.hook.restore.velero.io/command: "{{ ['/bin/sh', '-c', 'D=/home/node/.n8n/database.sqlite; B=/home/node/.n8n/database.backup.sqlite; if [ -f \"$B\" ]; then mv -f \"$B\" \"$D\"; rm -f \"$D-wal\" \"$D-shm\"; fi'] | to_json }}"
+              init.hook.restore.velero.io/timeout: "2m"
           spec:
             securityContext:
               runAsUser: 1000
               runAsGroup: 1000
               fsGroup: 1000
             containers:
+              # Sidecar providing the sqlite3 CLI so the Velero pre-hook can take a
+              # consistent `.backup` snapshot of database.sqlite (the n8n image has
+              # no sqlite3 and runs unprivileged). Runs as root to chown the snapshot
+              # back to uid 1000; idles otherwise (~10m/16Mi). sqlite is pulled once
+              # at start over the existing web egress (apk; ports 80/443).
+              - name: sqlite-backup
+                image: alpine:3.20
+                command: ["/bin/sh", "-c", "apk add --no-cache sqlite >/dev/null 2>&1 || true; exec sleep infinity"]
+                securityContext:
+                  runAsUser: 0
+                resources:
+                  requests: { cpu: 10m, memory: 16Mi }
+                  limits: { cpu: 100m, memory: 64Mi }
+                volumeMounts:
+                  - name: n8n-data
+                    mountPath: /home/node/.n8n
               - name: n8n
                 image: n8nio/n8n
                 ports:

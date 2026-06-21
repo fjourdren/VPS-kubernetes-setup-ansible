@@ -225,7 +225,7 @@
             - crowdsec
             - redis
             - minecraft
-            - wordpress
+            # - wordpress   # TODO: re-enable here when wordpress.yml is uncommented in main.yml
             - nextcloud
             - media
           # Exclude Helm release Secrets to avoid conflicts at restore time
@@ -259,7 +259,7 @@
             - crowdsec
             - redis
             - minecraft
-            - wordpress
+            # - wordpress   # TODO: re-enable here when wordpress.yml is uncommented in main.yml
             - nextcloud
             - media
           excludedResources:
@@ -289,9 +289,7 @@
         template:
           ttl: "1344h"   # 8 weeks
           storageLocation: default
-          # No FSB: this Schedule captures manifests + cluster-scoped
-          # resources only. Volume contents are handled by the namespace
-          # Schedules above (which run their pre-hooks).
+          # Manifests + cluster-scoped resources only (no data).
           defaultVolumesToFsBackup: false
           snapshotMoveData: false
           includeClusterResources: true
@@ -301,6 +299,8 @@
             - tailscale
           excludedResources:
             - "secrets.helm.sh"
+            # No pods -> no hooks, no FSB (data is the namespace Schedules' job)
+            - "pods"
             # Pod-scoped runtime data; no value in restoring it
             - "events"
             - "events.events.k8s.io"
@@ -382,6 +382,29 @@
                 annotations:
                   summary: "No successful Velero nightly backup in 25h"
                   description: "The nightly-full Schedule has not produced a successful backup in more than 25h."
+
+              # Catches the silent case where the metric series is ABSENT entirely
+              # (schedule never ran, renamed, or label drift) — the staleness rule
+              # above can't fire on an empty vector.
+              - alert: VeleroNightlyBackupMetricMissing
+                expr: absent(velero_backup_last_successful_timestamp{schedule="nightly-full"})
+                for: 30m
+                labels:
+                  context: velero
+                  severity: critical
+                annotations:
+                  summary: "Velero nightly backup metric missing"
+                  description: "No velero_backup_last_successful_timestamp for schedule=nightly-full. The Schedule may be renamed/removed or never produced a backup."
+
+              - alert: VeleroNoSuccessfulWeeklyBackup8d
+                expr: time() - velero_backup_last_successful_timestamp{schedule="weekly-full"} > 691200
+                for: 30m
+                labels:
+                  context: velero
+                  severity: warning
+                annotations:
+                  summary: "No successful Velero weekly backup in 8 days"
+                  description: "The weekly-full Schedule has not produced a successful backup in more than 8 days."
 
 ################################################################################
 #  ConfigMap (Grafana Dashboard)

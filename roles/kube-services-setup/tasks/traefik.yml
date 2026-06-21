@@ -34,6 +34,7 @@
   kubernetes.core.helm:
     name: traefik
     chart_ref: traefik/traefik
+    chart_version: "40.3.0"
     namespace: traefik
     create_namespace: true
     values:
