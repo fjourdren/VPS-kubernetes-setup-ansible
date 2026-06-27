@@ -126,6 +126,10 @@
 #  weekly-cluster-state) cannot be pre-deleted safely — it is restored as-is
 #  and only re-hydrates namespaces that do NOT already exist (i.e. a freshly
 #  wiped cluster); a loud warning is emitted instead of silently doing nothing.
+#
+#  Namespaces that get stuck in Terminating (lingering pods, NFS unmounts or
+#  finalizers) are force-cleared so the restore is never blocked by a 5-minute
+#  delete timeout.
 ################################################################################
 - name: Warn that a wildcard backup cannot be pre-deleted in-place
   ansible.builtin.debug:
@@ -139,15 +143,9 @@
     - mode == 'inplace'
     - "'*' in ns_list"
 
-- name: Delete target namespaces before in-place restore (confirmed)
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: Namespace
-    name: "{{ item }}"
-    wait: true
-    wait_timeout: 300
-  loop: "{{ ns_list | difference(protected_namespaces) }}"
+- name: Compute the in-place namespaces to wipe (protected ones excluded)
+  ansible.builtin.set_fact:
+    ns_to_wipe: "{{ ns_list | difference(protected_namespaces) }}"
   vars:
     protected_namespaces:
       - velero
@@ -159,6 +157,85 @@
     - mode == 'inplace'
     - confirm | bool
     - "'*' not in ns_list"
+
+- name: Request deletion of the target namespaces (non-blocking)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+    wait: false
+  loop: "{{ ns_to_wipe | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Force-delete all pods in the target namespaces (skip graceful drain)
+  ansible.builtin.command:
+    argv:
+      - microk8s
+      - kubectl
+      - delete
+      - pod
+      - --all
+      - "--namespace={{ item }}"
+      - --force
+      - --grace-period=0
+      - --ignore-not-found
+  loop: "{{ ns_to_wipe | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  changed_when: true
+  failed_when: false
+
+- name: Wait for the target namespaces to terminate
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  register: ns_terminating
+  loop: "{{ ns_to_wipe | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  until: ns_terminating.resources | length == 0
+  retries: 9           # up to 90s once the pods are gone (9 x 10s)
+  delay: 10
+  failed_when: false   # genuinely stuck namespaces are force-cleared below
+
+- name: Force-clear namespaces still stuck in Terminating
+  when: ns_to_wipe | default([]) | length > 0
+  block:
+    - name: Strip the kubernetes finalizer from namespaces still Terminating
+      ansible.builtin.command:
+        argv:
+          - microk8s
+          - kubectl
+          - replace
+          - --raw
+          - "/api/v1/namespaces/{{ item.item }}/finalize"
+          - -f
+          - "-"
+        stdin: "{{ item.resources[0] | combine({'spec': {'finalizers': []}}, recursive=True) | to_json }}"
+      loop: "{{ ns_terminating.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.resources | length > 0
+        - item.resources[0].status.phase | default('') == 'Terminating'
+      changed_when: true
+      failed_when: false
+
+    - name: Verify every target namespace is gone before restoring
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "{{ item }}"
+      register: ns_gone
+      loop: "{{ ns_to_wipe }}"
+      loop_control:
+        label: "{{ item }}"
+      until: ns_gone.resources | length == 0
+      retries: 12          # up to 1 min for the API to drop them (12 x 5s)
+      delay: 5
 
 ################################################################################
 #  Create the Restore and wait for completion
@@ -191,8 +268,8 @@
     restore_status.resources | length > 0
     and (restore_status.resources[0].status.phase | default('')
          in ['Completed', 'PartiallyFailed', 'Failed', 'FailedValidation'])
-  retries: 60
-  delay: 15
+  retries: 120
+  delay: 30
 
 ################################################################################
 #  Optional SQL replay (in-place only)
