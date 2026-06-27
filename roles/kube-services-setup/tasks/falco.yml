@@ -30,6 +30,17 @@
       driver:
         # CO-RE eBPF (kernel 5.8+); avoids needing linux-headers on the host.
         kind: modern_ebpf
+      # Backup hooks install sqlite3 at runtime (apk add), so it trips
+      # "Drop and execute new binary in container". Whitelist the backup call only.
+      customRules:
+        backup-sqlite-exceptions.yaml: |-
+          - macro: velero_sqlite_backup
+            condition: (proc.name=sqlite3 and proc.cmdline contains ".backup")
+
+          - rule: Drop and execute new binary in container
+            condition: and not velero_sqlite_backup
+            override:
+              condition: append
       resources:
         requests:
           cpu: 100m
