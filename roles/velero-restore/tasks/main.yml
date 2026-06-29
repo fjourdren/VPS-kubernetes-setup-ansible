@@ -1,10 +1,8 @@
 ################################################################################
 #  velero-restore - On-demand Velero restore (disaster recovery)
 #
-#  Re-injects data backed up by Velero (Scaleway / Kopia) back into the cluster
-#  by creating a velero.io/v1 Restore CRD. The restore re-creates the PVCs,
-#  which provision on the NFS server via the nfs-* StorageClasses, and the
-#  node-agent restores the volume contents from Kopia (File System Backup).
+#  Creates a velero.io/v1 Restore: re-creates the PVCs on NFS and restores their
+#  contents from Kopia (File System Backup).
 ################################################################################
 
 - name: Fetch Velero backups
@@ -50,29 +48,43 @@
 
 ################################################################################
 #  Resolve the backup to restore from
+#
+#  'latest' = newest scheduled data backup. Two kinds of Completed backup are
+#  excluded:
+#   - wildcard ('*') cluster-state backups: cannot drive an in-place data restore.
+#   - manual backups (no 'velero.io/schedule-name' label): may be contaminated
+#     with a duplicate 'restore-db-swap' initContainer -> restore PartiallyFails.
+#  Either can still be restored by name (-e backup=<name>).
 ################################################################################
-- name: Ensure at least one Completed backup exists (latest mode)
-  ansible.builtin.assert:
-    that:
-      - completed_backups | length > 0
-    fail_msg: "No Completed Velero backup found to restore from."
-  vars:
-    completed_backups: >-
+- name: Identify the Completed scheduled data backups (newest last; wildcard + manual excluded)
+  ansible.builtin.set_fact:
+    completed_data_backups: >-
       {{ velero_backups.resources
          | selectattr('status.phase', 'defined')
          | selectattr('status.phase', 'equalto', 'Completed')
+         | selectattr('spec.includedNamespaces', 'defined')
+         | rejectattr('spec.includedNamespaces', 'eq', ['*'])
+         | json_query('[?metadata.labels."velero.io/schedule-name"]')
+         | sort(attribute='status.completionTimestamp')
          | list }}
   when: backup == 'latest'
 
-- name: Resolve the latest Completed backup
+- name: Ensure at least one Completed scheduled data backup exists (latest mode)
+  ansible.builtin.assert:
+    that:
+      - completed_data_backups | length > 0
+    fail_msg: >-
+      No Completed scheduled data backup found. 'latest' resolves to the newest
+      schedule-created data backup (nightly-full/weekly-full); wildcard cluster-state
+      ('*') backups and ad-hoc/manual backups (no velero.io/schedule-name label) are
+      skipped — the former cannot drive an in-place data restore, the latter may be
+      contaminated. Pass one explicitly with -e backup=<name> if that is really what
+      you want.
+  when: backup == 'latest'
+
+- name: Resolve the latest Completed data backup
   ansible.builtin.set_fact:
-    backup_name: >-
-      {{ velero_backups.resources
-         | selectattr('status.phase', 'defined')
-         | selectattr('status.phase', 'equalto', 'Completed')
-         | sort(attribute='status.completionTimestamp')
-         | map(attribute='metadata.name')
-         | list | last }}
+    backup_name: "{{ completed_data_backups | map(attribute='metadata.name') | list | last }}"
   when: backup == 'latest'
 
 - name: Use the explicitly requested backup
@@ -92,11 +104,8 @@
 ################################################################################
 #  Build the restore targets
 #
-#  When namespaces=all we resolve the concrete namespace set from the backup's
-#  own spec.includedNamespaces (schedule-created backups record it). This is
-#  what lets an in-place "all" restore actually pre-delete the right namespaces
-#  so Velero re-creates their PVCs — without it, Velero never overwrites an
-#  existing PVC and the volume data is silently skipped.
+#  namespaces=all -> use the namespace set recorded in the backup, so an in-place
+#  "all" restore pre-deletes the right namespaces (Velero never overwrites a PVC).
 ################################################################################
 - name: Resolve the namespaces recorded in the chosen backup
   ansible.builtin.set_fact:
@@ -119,17 +128,10 @@
   when: mode == 'recover'
 
 ################################################################################
-#  In-place only: wipe the target namespaces first so Velero re-creates the
-#  PVCs (Velero never overwrites existing volumes). Gated behind confirm=true.
-#
-#  Protected namespaces are never deleted. A wildcard ('*') backup (e.g.
-#  weekly-cluster-state) cannot be pre-deleted safely — it is restored as-is
-#  and only re-hydrates namespaces that do NOT already exist (i.e. a freshly
-#  wiped cluster); a loud warning is emitted instead of silently doing nothing.
-#
-#  Namespaces that get stuck in Terminating (lingering pods, NFS unmounts or
-#  finalizers) are force-cleared so the restore is never blocked by a 5-minute
-#  delete timeout.
+#  In-place only (confirm=true): wipe the target namespaces so Velero re-creates
+#  their PVCs (it never overwrites existing volumes). Protected namespaces are
+#  never deleted; a wildcard backup is left as-is (warning below). Namespaces
+#  stuck Terminating are force-cleared so a delete timeout can't block the restore.
 ################################################################################
 - name: Warn that a wildcard backup cannot be pre-deleted in-place
   ansible.builtin.debug:
@@ -238,6 +240,117 @@
       delay: 5
 
 ################################################################################
+#  In-place only: wait for the wiped namespaces' Delete-policy PVs to be reclaimed
+#  before restoring.
+#
+#  nfs-runtime uses a name-based subDir (<ns>/<pvc>): the old PV points at the same
+#  dir Velero re-creates, so a late reclaim wipes the fresh data -> "stale NFS file
+#  handle". Draining the reclaimer first avoids it. Retain PVs are left alone.
+################################################################################
+- name: Wait for the wiped namespaces' Delete-policy PVs to be reclaimed
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+  register: _orphan_pvs
+  until: >-
+    (_orphan_pvs.resources | default([])
+     | selectattr('spec.claimRef', 'defined')
+     | selectattr('spec.persistentVolumeReclaimPolicy', 'equalto', 'Delete')
+     | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe)
+     | list | length) == 0
+  retries: 24          # up to 2 min for the reclaimer to drain
+  delay: 5
+  failed_when: false   # a PV stuck in VolumeFailedDelete is force-cleared below
+  when: ns_to_wipe | default([]) | length > 0
+
+################################################################################
+#  In-place only: force-clear Delete-policy PVs stuck un-reclaimed.
+#
+#  If the PV's NFS dir is already gone, nfs-csi DeleteVolume loops forever and the
+#  PV sticks Released, hanging the wait above. Anything still Delete+present after
+#  the 2-min drain is stuck: delete it and strip its finalizers (data is gone).
+################################################################################
+- name: Re-query Delete-policy PVs still un-reclaimed in the wiped namespaces
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+  register: _stuck_pvs
+  when: ns_to_wipe | default([]) | length > 0
+
+- name: Request deletion of the stuck Delete-policy PVs (non-blocking)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ item.metadata.name }}"
+    wait: false
+  loop: "{{ _stuck_delete_pvs }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  vars:
+    _stuck_delete_pvs: >-
+      {{ (_stuck_pvs.resources | default([]))
+         | selectattr('spec.claimRef', 'defined')
+         | selectattr('spec.persistentVolumeReclaimPolicy', 'equalto', 'Delete')
+         | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe | default([]))
+         | list }}
+  when: ns_to_wipe | default([]) | length > 0
+
+- name: Strip finalizers so the stuck Delete-policy PVs are actually removed
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: merge   # JSON merge patch: replace the finalizers array with []
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ item.metadata.name }}"
+    definition:
+      metadata:
+        finalizers: []
+  loop: "{{ _stuck_delete_pvs }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  vars:
+    _stuck_delete_pvs: >-
+      {{ (_stuck_pvs.resources | default([]))
+         | selectattr('spec.claimRef', 'defined')
+         | selectattr('spec.persistentVolumeReclaimPolicy', 'equalto', 'Delete')
+         | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe | default([]))
+         | list }}
+  failed_when: false
+  when: ns_to_wipe | default([]) | length > 0
+
+################################################################################
+#  In-place only: drop the wiped namespaces' retained (Released) PVs so the
+#  restored PVCs re-provision. Deleting a Retain PV keeps its NFS dir (the data),
+#  and Velero re-creates the PVC at the same subDir. media-library (non-FSB) is
+#  handled by the directory-ensure step below.
+################################################################################
+- name: Find the wiped namespaces' retained (Released) PVs
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+  register: _retained_pvs
+  when: ns_to_wipe | default([]) | length > 0
+
+- name: Delete the retained PVs so the restored PVCs re-provision (dir preserved)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolume
+    name: "{{ item.metadata.name }}"
+  loop: >-
+    {{ _retained_pvs.resources | default([])
+       | selectattr('spec.claimRef', 'defined')
+       | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe | default([]))
+       | selectattr('spec.persistentVolumeReclaimPolicy', 'equalto', 'Retain')
+       | selectattr('spec.csi', 'defined')
+       | selectattr('spec.csi.driver', 'equalto', 'nfs.csi.k8s.io')
+       | list }}
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: ns_to_wipe | default([]) | length > 0
+
+################################################################################
 #  Create the Restore and wait for completion
 ################################################################################
 - name: Create the Velero Restore
@@ -254,8 +367,88 @@
           {'backupName': backup_name, 'existingResourcePolicy': 'update'}
           | combine({'includedNamespaces': ns_list} if namespaces != 'all' else {})
           | combine({'namespaceMapping': namespace_mapping} if mode == 'recover' else {})
+          | combine({'excludedResources': recover_excluded_resources} if mode == 'recover' else {})
         }}
   register: created_restore
+
+################################################################################
+#  In-place only: ensure the NFS dir exists for every volume Velero restores
+#  VERBATIM (excluded from FSB, e.g. media-library).
+#
+#  Such a PV is restored as-is, pointing at a subDir that may no longer exist ->
+#  the pod can't mount it -> stays Init -> the restore hangs InProgress forever.
+#  We mkdir the empty subDir (via the csi-nfs-node pod); the kubelet then mounts
+#  on retry. Idempotent — existing dirs are untouched.
+################################################################################
+- name: Find the csi-nfs-node pod (used to reach the NFS server)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app=csi-nfs-node
+  register: _csi_node
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+
+- name: Wait for Velero to (re)create the target namespaces' nfs PersistentVolumes
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+  register: _post_restore_pvs
+  until: >-
+    (_post_restore_pvs.resources | default([])
+     | selectattr('spec.csi', 'defined')
+     | selectattr('spec.csi.driver', 'equalto', 'nfs.csi.k8s.io')
+     | selectattr('spec.claimRef', 'defined')
+     | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe | default([]))
+     | list | length) > 0
+  retries: 30          # up to 5 min for Velero to restore the PVs
+  delay: 10
+  failed_when: false
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+
+- name: Ensure each restored nfs volume's NFS directory exists (create empty if missing)
+  ansible.builtin.command:
+    argv:
+      - microk8s
+      - kubectl
+      - -n
+      - kube-system
+      - exec
+      - "{{ _csi_node.resources[0].metadata.name }}"
+      - -c
+      - nfs
+      - --
+      - sh
+      - -c
+      - >-
+        m="/tmp/ensure-{{ item.metadata.name }}";
+        sub="{{ item.spec.csi.volumeAttributes.subDir }}";
+        mkdir -p "$m";
+        if mount -t nfs -o nfsvers=4.1 "{{ item.spec.csi.volumeAttributes.server }}:{{ item.spec.csi.volumeAttributes.share }}" "$m"; then
+        [ -d "$m/$sub" ] || { mkdir -p "$m/$sub" && chmod 0777 "$m/$sub"; };
+        umount "$m";
+        fi;
+        rmdir "$m" 2>/dev/null || true
+  loop: >-
+    {{ (_post_restore_pvs | default({})).resources | default([])
+       | selectattr('spec.csi', 'defined')
+       | selectattr('spec.csi.driver', 'equalto', 'nfs.csi.k8s.io')
+       | selectattr('spec.claimRef', 'defined')
+       | selectattr('spec.claimRef.namespace', 'in', ns_to_wipe | default([]))
+       | list }}
+  loop_control:
+    label: "{{ item.spec.claimRef.namespace }}/{{ item.spec.csi.volumeAttributes.subDir }}"
+  changed_when: true
+  failed_when: false
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+    - _csi_node.resources | default([]) | length > 0
 
 - name: Wait for the restore to finish
   kubernetes.core.k8s_info:
@@ -272,48 +465,52 @@
   delay: 30
 
 ################################################################################
-#  Optional SQL replay (in-place only)
+#  SQL replay (in-place only)
 #
-#  PostgreSQL/MySQL only back up a logical dump (all.sql / wordpress.sql), never
-#  the live datadir, so a fresh restore comes up with an EMPTY database until the
-#  dump is replayed. In-place restores replay it automatically once the DB pod is
-#  Ready. Uses the pod's own credentials env (no secrets needed here). Errors on
-#  already-existing roles/objects are non-fatal.
+#  PostgreSQL/MySQL back up only a logical dump (all.sql / wordpress.sql), not the
+#  datadir, so a restore comes up empty and we replay the dump onto it.
+#
+#  We relax the liveness probe first: under post-restore load the default 5s
+#  pg_isready probe can time out and the kubelet kills postgres mid-replay.
+#  We do NOT reset the data PVC — re-provisioning the same subDir breaks the mount.
 ################################################################################
-- name: Wait for PostgreSQL to be Ready before replaying the dump
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: Pod
+- name: Relax the PostgreSQL liveness probe before replaying the dump
+  kubernetes.core.k8s:
+    state: patched
+    merge_type: strategic-merge   # merge the container by name; never replace the containers array
+    api_version: apps/v1
+    kind: StatefulSet
     namespace: postgresql
-    label_selectors: ["app.kubernetes.io/name=postgresql"]
-  register: _pg_pod
-  until: >-
-    (_pg_pod.resources | default([])) | length > 0 and
-    ((_pg_pod.resources[0].status.conditions | default([])
-      | selectattr('type', 'equalto', 'Ready')
-      | map(attribute='status') | list | first | default('False')) == 'True')
-  retries: 40
-  delay: 15
+    name: postgresql
+    definition:
+      spec:
+        template:
+          spec:
+            containers:
+              - name: postgresql
+                livenessProbe:
+                  failureThreshold: 30
+                  periodSeconds: 15
+                  timeoutSeconds: 15
   when:
     - mode == 'inplace'
     - "'postgresql' in ns_list"
 
-- name: Replay pg_dumpall into PostgreSQL
-  ansible.builtin.command:
-    argv:
-      - microk8s
-      - kubectl
-      - exec
-      - -n
-      - postgresql
-      - sts/postgresql
-      - --
-      - sh
-      - -c
-      - 'PGPASSWORD="$(cat $POSTGRES_PASSWORD_FILE)" psql -U postgres -h 127.0.0.1 -f /dump/all.sql'
+- name: Replay the PostgreSQL dump onto the restored (empty) datadir
+  ansible.builtin.shell: |
+    set -e
+    NS=postgresql
+    # Wait for the freshly-restored PostgreSQL (empty datadir) to be Ready.
+    microk8s kubectl -n "$NS" rollout status statefulset postgresql --timeout=300s
+    # Replay the logical dump (ON_ERROR_STOP=0 so "already exists" from the initdb
+    # scripts is non-fatal). Target the pod + container explicitly.
+    microk8s kubectl exec -n "$NS" postgresql-0 -c postgresql -- \
+      sh -c 'PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")" psql -v ON_ERROR_STOP=0 -U postgres -h 127.0.0.1 -f /dump/all.sql'
   register: _pg_replay
+  until: _pg_replay.rc == 0
+  retries: 3
+  delay: 15
   changed_when: true
-  failed_when: _pg_replay.rc != 0
   when:
     - mode == 'inplace'
     - "'postgresql' in ns_list"
@@ -337,6 +534,74 @@
   when:
     - mode == 'inplace'
     - "'wordpress' in ns_list"
+
+################################################################################
+#  In-place only: replace the restore-created pods so the next backup is clean.
+#
+#  The sqlite apps carry a Velero init restore hook ('restore-db-swap') that swaps
+#  the consistent snapshot over the live DB. Velero bakes that container into the
+#  restored pod; if a backup later captures it, the next restore injects a second
+#  one and the pod is rejected ("Duplicate value: restore-db-swap") -> the restore
+#  PartiallyFails. So we delete those pods; the controller re-creates a clean one.
+#
+#  We wait for each pod to be Ready first: init containers finish before the app
+#  starts, so Ready means the swap already ran (deleting sooner would preempt it).
+################################################################################
+- name: List pods in the wiped namespaces (to find restore-injected ones)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+  register: _post_restore_all_pods
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+
+- name: Wait for each injected pod to become Ready (its restore-db-swap has run)
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+  register: _injected_ready
+  loop: "{{ _post_restore_all_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  until: >-
+    _injected_ready.resources | length == 0
+    or (_injected_ready.resources[0].status.conditions | default([])
+        | selectattr('type', 'equalto', 'Ready')
+        | selectattr('status', 'equalto', 'True') | list | length) > 0
+  retries: 30          # up to 3 min for init+swap+app start (30 x 6s)
+  delay: 6
+  failed_when: false   # never block the restore on a slow/failing app pod
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+    - item.metadata.namespace in ns_to_wipe
+    - >-
+      (item.spec.initContainers | default([])
+       | map(attribute='name') | select('equalto', 'restore-db-swap')
+       | list | length) > 0
+
+- name: Replace the restore-created pods so the next backup is never contaminated
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Pod
+    namespace: "{{ item.metadata.namespace }}"
+    name: "{{ item.metadata.name }}"
+    wait: false
+  loop: "{{ _post_restore_all_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+  when:
+    - mode == 'inplace'
+    - ns_to_wipe | default([]) | length > 0
+    - item.metadata.namespace in ns_to_wipe
+    - >-
+      (item.spec.initContainers | default([])
+       | map(attribute='name') | select('equalto', 'restore-db-swap')
+       | list | length) > 0
 
 ################################################################################
 #  Report

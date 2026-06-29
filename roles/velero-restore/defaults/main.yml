@@ -1,7 +1,43 @@
 ---
-# See restore.yml for the full parameter documentation.
-list: false          # true -> only list the available Completed backups
-backup: latest       # backup name, or "latest" (most recent Completed)
-namespaces: ""       # comma-separated namespaces, or "all" (required unless list=true)
-mode: recover        # recover -> <ns>-recover (safe) | inplace -> original namespaces
-confirm: false       # required for inplace to delete target namespaces first
+# Default values for the velero-restore role. Override any of them on the
+# command line with -e (for example: -e namespaces=kuma -e mode=inplace).
+# Full usage, parameter docs, and examples live in restore.yml.
+
+# Only print the list of restorable backups, then stop without restoring.
+# Useful to discover backup names before running a real restore.
+list: false
+
+# Which backup to restore from: an exact backup name, or "latest" to pick the
+# most recent successful (Completed) backup automatically.
+backup: latest
+
+# Which namespaces to restore. Either a comma-separated list (e.g. "kuma,postgresql")
+# or "all" to restore every namespace contained in the backup.
+# Required unless list=true.
+namespaces: ""
+
+# How to restore:
+#   recover -> restore into a separate "<ns>-recover" namespace, leaving the live
+#              service untouched. Safe default, used to pull data back out by hand.
+#   inplace -> restore directly into the original namespaces, overwriting them.
+mode: recover
+
+# Safety switch for inplace mode. inplace deletes the target namespaces before
+# restoring, so it refuses to run unless you explicitly pass confirm=true.
+confirm: false
+
+# Kubernetes resources that are skipped during a recover-mode restore.
+#
+# Why: a "<ns>-recover" copy must never steal traffic from the live service.
+# Traefik IngressRoutes (plus the TCP/UDP variants) and standard k8s Ingresses
+# all match on the same Host() rule. If we restored them, Traefik would start
+# routing the real hostname to the freshly restored (and not-yet-ready) recover
+# pods, breaking the live service with 503 errors.
+#
+# Recover namespaces are meant for data recovery only. To reach a recovered pod,
+# use `kubectl port-forward` instead of going through the public hostname.
+recover_excluded_resources:
+  - ingressroutes.traefik.io
+  - ingressroutetcps.traefik.io
+  - ingressrouteudps.traefik.io
+  - ingresses.networking.k8s.io
