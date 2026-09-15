@@ -76,7 +76,7 @@
   loop: "{{ existing_pools.resources }}"
   when:
     - item.metadata.name not in ['public-pool', 'private-pool']
-    - ansible_host in (item.spec.addresses | join(','))
+    - item.spec.autoAssign | default(true)
 
 - name: Get existing L2Advertisements
   kubernetes.core.k8s_info:

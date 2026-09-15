@@ -226,6 +226,15 @@
     ns: n8n
     pod_selector: { app: n8n }
 
+
+- include_tasks: _netpol/egress-to-namespace.yml
+  vars:
+    ns: n8n
+    name: webhook-proxy
+    pod_selector: { app: n8n }
+    target_namespace: n8n-webhook-proxy
+    port: 3000
+
 ################################################################################
 #  ServiceMonitor (Prometheus Operator)
 ################################################################################

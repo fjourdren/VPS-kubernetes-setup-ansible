@@ -2,6 +2,7 @@
 - name: Check if this node is microk8s
   ansible.builtin.stat:
     path: /var/snap/microk8s/common/var/lib/kubelet
+  become: true # /var/snap/microk8s/common/var is 0700 root
   register: microk8s_kubelet_root
 
 - name: Check if NFS CSI driver is already installed

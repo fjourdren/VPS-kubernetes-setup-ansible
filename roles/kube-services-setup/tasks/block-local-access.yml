@@ -4,6 +4,10 @@
     kind: Namespace
   register: ns_list
 
+- include_tasks: _netpol/dns-egress.yml
+  vars: { ns: "{{ item }}" }
+  loop: "{{ ['container-registry', 'default'] | intersect(ns_list.resources | map(attribute='metadata.name') | list) }}"
+
 - name: Apply egress policy to namespaces (block LAN except gateway + NFS)
   vars:
     excluded_namespaces:
@@ -28,6 +32,8 @@
                   cidr: 0.0.0.0/0
                   except:
                     - "{{ network.private_cidr }}"
+                    - "10.1.0.0/16"        # MicroK8s pod CIDR (default)
+                    - "10.152.183.0/24"    # MicroK8s service CIDR (default)
           - to:
               - ipBlock:
                   cidr: "{{ network.host_gateway }}/32"

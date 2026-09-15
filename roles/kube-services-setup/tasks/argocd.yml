@@ -150,6 +150,10 @@
           - to:
               - ipBlock:
                   cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+                    - "10.1.0.0/16"
+                    - "10.152.183.0/24"
               - ipBlock:
                   cidr: "::/0"
             ports:

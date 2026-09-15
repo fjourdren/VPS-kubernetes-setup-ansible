@@ -294,6 +294,8 @@
                   cidr: 0.0.0.0/0
                   except:
                     - "{{ network.private_cidr }}"
+              - ipBlock:
+                  cidr: "{{ network.dns | default(network.host_gateway) }}/32"
             ports:
               - { protocol: UDP, port: 53 }
               - { protocol: TCP, port: 53 }

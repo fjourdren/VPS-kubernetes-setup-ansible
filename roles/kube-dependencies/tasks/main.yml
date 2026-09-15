@@ -6,10 +6,11 @@
     cache_valid_time: 300
   become: true
 
-- name: Ensure CA certificates tools are present
+- name: Ensure CA certificates tools and snapd are present
   apt:
     name:
       - ca-certificates
+      - snapd
     state: present
     update_cache: yes
   become: true
@@ -30,3 +31,19 @@
     state: present
     update_cache: yes
   become: true
+
+# The community.general snap module resolves the snap name through `snap info`,
+# which the Snap Store answers with HTTP 429 under rate-limiting; snapd then
+# prints `error: no snap found` and the module dies on `IndexError: list index
+# out of range`. Installing microk8s here (with retries) means istvano.microk8s
+# only ever sees an already-installed snap, for which `snap info` is served
+# locally and never touches the store.
+- name: Install microk8s snap (store rate-limits, so retry)
+  ansible.builtin.command:
+    cmd: "snap install microk8s --classic --channel={{ microk8s_version }}"
+    creates: /snap/bin/microk8s
+  become: true
+  register: microk8s_snap_install
+  retries: 10
+  delay: 15
+  until: microk8s_snap_install is not failed

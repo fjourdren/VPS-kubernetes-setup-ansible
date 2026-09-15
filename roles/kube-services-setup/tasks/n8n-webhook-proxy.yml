@@ -282,6 +282,41 @@
     pod_selector: { app: n8n-webhook-proxy }
     port: 3000
 
+- name: "[netpol/n8n-webhook-proxy] ingress from n8n (port 3000)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: n8n-webhook-proxy-allow-n8n-ingress
+        namespace: n8n-webhook-proxy
+      spec:
+        podSelector:
+          matchLabels:
+            app: n8n-webhook-proxy
+        policyTypes: [Ingress]
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: n8n
+                podSelector:
+                  matchLabels:
+                    app: n8n
+            ports:
+              - { protocol: TCP, port: 3000 }
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5
+
+- include_tasks: _netpol/web-egress.yml
+  vars:
+    ns: n8n-webhook-proxy
+    pod_selector: { app: n8n-webhook-proxy }
+    name_suffix: targets
+
 # n8n-webhook-proxy -> n8n (port 5678) — must match a specific pod, not just
 # the namespace, hence the inline policy rather than egress-to-namespace.yml.
 - name: "[netpol/n8n-webhook-proxy] egress -> n8n (port 5678)"

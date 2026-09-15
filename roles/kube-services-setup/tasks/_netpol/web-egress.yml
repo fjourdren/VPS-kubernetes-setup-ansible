@@ -31,6 +31,8 @@
                   cidr: 0.0.0.0/0
                   except:
                     - "{{ network.private_cidr }}"
+                    - "10.1.0.0/16"        # MicroK8s pod CIDR (default)
+                    - "10.152.183.0/24"    # MicroK8s service CIDR (default)
             ports: "{{ ports | default([80, 443]) | map('community.general.dict_kv', 'port') | map('combine', {'protocol': 'TCP'}) | list }}"
           - to:
               - ipBlock:

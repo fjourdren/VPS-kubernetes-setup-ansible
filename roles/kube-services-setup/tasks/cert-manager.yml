@@ -2,6 +2,7 @@
 #  ClusterIssuer (Cert-Manager)
 ################################################################################
 - name: Create Cloudflare API Token Secret
+  no_log: true
   kubernetes.core.k8s:
     state: present
     definition:
@@ -77,3 +78,31 @@
   vars:
     ns: cert-manager
     name_suffix: internet
+
+- name: "[netpol/cert-manager] DNS-01 self-check egress to public resolvers"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: cert-manager-allow-dns01-selfcheck-egress
+        namespace: cert-manager
+      spec:
+        podSelector: {}
+        policyTypes: [Egress]
+        egress:
+          - to:
+              - ipBlock:
+                  cidr: 0.0.0.0/0
+                  except:
+                    - "{{ network.private_cidr }}"
+                    - "10.1.0.0/16"
+                    - "10.152.183.0/24"
+            ports:
+              - { protocol: UDP, port: 53 }
+              - { protocol: TCP, port: 53 }
+  register: _netpol_apply
+  until: _netpol_apply is not failed
+  retries: 5
+  delay: 5

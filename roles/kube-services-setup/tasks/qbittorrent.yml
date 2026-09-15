@@ -13,7 +13,7 @@
 #  the protocol allows. The init container pre-seeds qBittorrent.conf and
 #  categories.json on first start ONLY (subsequent edits via WebUI persist).
 #
-#  First login: WebUI is at https://qbittorrent.{{ network.private_domain }}
+#  First login: WebUI is at http://qbittorrent.{{ network.private_domain }}
 #  with username `admin`. The temporary password is printed in the pod logs:
 #    kubectl logs -n media -l app=qbittorrent | grep -i "temporary password"
 #  Reset it via Tools -> Options -> WebUI on first login.
@@ -163,6 +163,12 @@
                     if [ ! -f /config/qBittorrent/categories.json ]; then
                       cp /seed/categories.json /config/qBittorrent/categories.json
                     fi
+                    # The config PVC is Retain-backed on NFS, so it outlives the
+                    # cluster. A lockfile/ipc-socket left by a pod that was never
+                    # shut down cleanly makes qbittorrent-nox exit one second
+                    # after start, forever (CrashLoop on the startup probe).
+                    # Nothing holds them at init time -- the app is not running.
+                    rm -f /config/qBittorrent/lockfile /config/qBittorrent/ipc-socket
                     chown -R 1000:1000 /config
                 volumeMounts:
                   - name: config
@@ -317,6 +323,8 @@
                   cidr: 0.0.0.0/0
                   except:
                     - "{{ network.private_cidr }}"
+                    - "10.1.0.0/16"        # MicroK8s pod CIDR (default)
+                    - "10.152.183.0/24"    # MicroK8s service CIDR (default)
           - to:
               - ipBlock:
                   cidr: ::/0

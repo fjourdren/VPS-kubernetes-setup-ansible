@@ -6,6 +6,9 @@
     url: https://www.cloudflare.com/ips-v4/
     return_content: yes
   register: cloudflare_ipv4_raw
+  until: cloudflare_ipv4_raw is not failed
+  retries: 3
+  delay: 5
 
 - name: Parse Cloudflare IPv4 ranges
   set_fact:
@@ -16,10 +19,23 @@
     url: https://www.cloudflare.com/ips-v6/
     return_content: yes
   register: cloudflare_ipv6_raw
+  until: cloudflare_ipv6_raw is not failed
+  retries: 3
+  delay: 5
 
 - name: Parse Cloudflare IPv6 ranges
   set_fact:
     cloudflare_ipv6_ranges: "{{ cloudflare_ipv6_raw.content.split('\n') | select('match', '^[0-9a-fA-F:]') | list }}"
+
+- name: Fail early if the Cloudflare ranges came back empty
+  assert:
+    that:
+      - cloudflare_ipv4_ranges | length > 0
+      - cloudflare_ipv6_ranges | length > 0
+    fail_msg: >-
+      Cloudflare returned no usable IP ranges (v4={{ cloudflare_ipv4_ranges | length }},
+      v6={{ cloudflare_ipv6_ranges | length }}). Deploying would set an empty
+      allowlist and 403 every public visitor.
 
 - name: Combine Cloudflare IP ranges
   set_fact:
@@ -135,7 +151,7 @@
             namespace: traefik
           spec:
             ipAllowList:
-              sourceRange: "{{ ['127.0.0.1/8', '192.168.0.0/16', '10.0.0.0/8'] + (traefik.allowed_ips | default([])) }}"
+              sourceRange: "{{ ['127.0.0.1/8', '192.168.0.0/16', '10.0.0.0/8', '100.64.0.0/10'] + (traefik.allowed_ips | default([])) }}"
         - apiVersion: traefik.io/v1alpha1
           kind: Middleware
           metadata:
@@ -394,6 +410,7 @@
       - portainer
       - monitoring
       - logging
+      - media           # jellyfin (8096) + qbittorrent (8080)
   kubernetes.core.k8s:
     state: present
     definition:

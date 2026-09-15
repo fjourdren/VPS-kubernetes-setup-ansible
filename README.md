@@ -149,7 +149,8 @@ Anything that's truly service-specific (e.g. ECK pod-to-pod, Traefik's egress to
 
 ### Notes on a few special cases
 
-- **Tailscale, Falco, Filebeat, MetalLB speaker, CrowdSec firewall bouncer.** These run with `hostNetwork: true` for their kernel/wire-level needs. NetworkPolicies do **not** apply to host-network pods, so the policies in those namespaces are scoped to the cluster-network pods only (operator pod, falcosidekick, metallb controller, lapi/agent). The Tailscale tailnet ACL is the actual access boundary for tailnet → cluster traffic.
+- **MetalLB speaker and the CrowdSec firewall bouncer** run with `hostNetwork: true` for their wire-level needs. NetworkPolicies do **not** apply to host-network pods, so the policies in those namespaces are scoped to the cluster-network pods only (metallb controller, lapi/agent).
+- **Tailscale is *not* host-network.** The operator and the `Connector` proxies it creates are ordinary pods (`NET_ADMIN` + `/dev/net/tun`), which is exactly why the two egress policies in `tailscale.yml` are needed — on a host-network pod they would not apply at all. The tailnet ACL is still the access boundary for tailnet → cluster traffic, but it is not the only one.
 - **Prometheus egress.** The monitoring namespace allows Prometheus egress to *every* in-cluster namespace, with no port pinning. The previous version pinned a fixed list of ports (9090, 9100, 9187, 8080-8084, …) which silently broke scraping for any new exporter on a port outside the list (Falco 8765, Velero 8085, Kuma 3001, redis-exporter 9121, …). Each scrape target's own ingress policy is the real gate.
 - **Database namespaces (`postgresql`, `redis`).** Allowed client namespaces are listed once in a single `*_client_namespaces` Ansible variable inside the namespace's task file. Adding a new client = adding one line.
 - **Traefik backends.** Same pattern — `traefik_backend_namespaces` in `traefik.yml` is the single source of truth.
@@ -162,9 +163,9 @@ Anything that's truly service-specific (e.g. ECK pod-to-pod, Traefik's egress to
 - Selector: `{}` — all pods.
 - Allows egress to `0.0.0.0/0` **except** the LAN CIDR (`network.private_cidr`), plus an explicit allow to the host gateway `{{ network.host_gateway }}/32` (which is what containerd / NFS volume mounts hit through the host).
 
-`kube-system` is intentionally excluded so the NFS CSI driver can reach the NAS; everything else is forced to either go through the public Internet or stay inside the cluster. Per-namespace policies (the `web-egress` ones) re-open Internet egress on the specific ports each app needs while staying compatible with the LAN block — both policies stack and the more permissive of the two wins on a given destination.
+`kube-system` is intentionally excluded so the NFS CSI driver can reach the NAS; everything else is forced to either go through the public Internet or stay inside the cluster. Per-namespace policies (the `web-egress` ones) re-open Internet egress on the specific ports each app needs. NetworkPolicy rules are a **union**, so this policy is as permissive as a namespace ever gets — that is why its `except` list also carries the pod CIDR (`10.1.0.0/16`) and the service CIDR (`10.152.183.0/24`). Without them it would grant every pod egress to every other pod and every ClusterIP, silently voiding `default-deny`, `egress-to-namespace` and `traefik_backend_namespaces`. It stays portless towards the Internet on purpose: cert-manager's DNS-01 self-check needs UDP/TCP 53 to public resolvers.
 
-The only deliberate LAN exception is `kuma-allow-traefik-lb-egress` in `kuma.yml`, which lets Uptime Kuma probe its own services through the private + public Traefik LB IPs (`network.private_address`, `network.public_address`) on 80, 443 and 25565. That's the only legal way for an in-cluster pod to dial `192.168.1.220` directly.
+The only deliberate LAN exception is `kuma-allow-uptime-kuma-egress` in `kuma.yml`, which re-opens the **public** LB IP (`network.public_address`) so Uptime Kuma can run its Minecraft TCP probe. Note it is scoped by pod label (`app: uptime-kuma`) but **not** by port, and it deliberately keeps the cluster CIDRs reachable — probing in-cluster services on arbitrary ports is what that pod is for. `network.private_address` is *not* in the exception: probes reach `192.168.1.220` because kube-proxy DNATs LoadBalancer IPs before Calico evaluates egress, not because a policy allows it.
 
 ### Debugging NetworkPolicies
 
@@ -213,7 +214,7 @@ The `spec.config` block accepts every field that the Kuma UI exposes (`type`, `u
 
 Implementation notes:
 - The KumaEntity CRD is installed by `roles/kube-services-setup/tasks/autokuma.yml`, which runs **before** any application task file so each service can register its own monitor on the same playbook run.
-- Kuma probes services through their real ingress path (DNS → Traefik → backend). The `kuma-allow-traefik-lb-egress` NetworkPolicy in `kuma.yml` is the only exception to the LAN-egress block, scoped to the two Traefik LoadBalancer IPs on ports 80, 443 and 25565 (Minecraft).
+- Kuma probes services through their real ingress path (DNS → Traefik → backend). The `kuma-allow-uptime-kuma-egress` NetworkPolicy in `kuma.yml` is the only exception to the LAN-egress block, and it covers the public LB IP only (`network.public_address`, for the Minecraft probe) with no port restriction.
 - AutoKuma reuses the existing `kuma.username` / `kuma.password` from `secrets.yml` — no new secret to provision.
 - All services shipped by this repo are tagged out of the box (Kuma itself, Heimdall, Grafana, Prometheus, Alertmanager, Loki, Portainer, pgAdmin, PostgreSQL, Redis, Ghostfolio, n8n, n8n-webhook-proxy, Nextcloud, Nginx, Wordpress, Minecraft, Jellyfin, qBittorrent).
 
@@ -723,10 +724,12 @@ spec:
 
 #### Cloudflare IP Whitelisting
 
-All public IngressRoutes automatically include the `cloudflare-ips` middleware, which:
+All public IngressRoutes reference the `public-security` **chain**, which runs `cloudflare-ips` and then `crowdsec-bouncer`. The `cloudflare-ips` half:
 - Blocks all traffic NOT coming from Cloudflare's IP ranges
-- Fetches the latest Cloudflare IP ranges on each deployment
+- Fetches the latest Cloudflare IP ranges on each deployment — the list is baked into the Helm release, so it is **frozen until the next `deploy.yml` run**. Cloudflare adds ranges occasionally; visitors arriving from a new one get a 403 until you redeploy.
 - Prevents direct access to your server IP
+
+The exception is Minecraft (25565): `IngressRouteTCP` cannot use HTTP middlewares, so that port has neither the Cloudflare allowlist nor the CrowdSec bouncer in front of it — only the nftables firewall bouncer covers it.
 
 **Middleware Configuration** (auto-deployed):
 ```yaml
@@ -751,7 +754,7 @@ This setup provides **three deployment patterns** for public services:
 
 ##### Pattern 1: HTTP + HTTPS (Both Accessible)
 
-Use when you want both HTTP and HTTPS to work simultaneously (default for most services).
+Use when you want both HTTP and HTTPS to work simultaneously.
 
 ```yaml
 # HTTP IngressRoute
@@ -807,9 +810,9 @@ Use when you want both HTTP and HTTPS to work simultaneously (default for most s
 - ✅ `http://nginx.example.com` → Works (via Cloudflare)
 - ✅ `https://nginx.example.com` → Works (Let's Encrypt cert)
 
-##### Pattern 2: HTTP → HTTPS Redirect (Recommended)
+##### Pattern 2: HTTP → HTTPS Redirect (Recommended — and what is deployed)
 
-Use when you want to force all traffic to HTTPS. Uncomment the HTTP redirect IngressRoute.
+Use when you want to force all traffic to HTTPS. This is the active pattern for every public service in the repo.
 
 **Step 1**: Comment out the standard HTTP IngressRoute  
 **Step 2**: Uncomment the HTTP redirect IngressRoute (included in all service files):
@@ -859,11 +862,13 @@ Use when you want to force all traffic to HTTPS. Uncomment the HTTP redirect Ing
 3. Uncomment the HTTP redirect IngressRoute
 4. Redeploy: `ansible-playbook deploy.yml -i hosts --key-file ~/.ssh/id_rsa --ask-vault-pass`
 
-**To switch from staging to production certificates:**
+**Staging vs production certificates:**
 
-1. Change `letsencrypt-staging` to `letsencrypt-prod` in Certificate resources
-2. Change `nginx-cert-staging` to `nginx-cert-prod` in IngressRoute TLS sections
-3. Redeploy
+`cert-manager.yml` creates both ClusterIssuers, but every `Certificate` in the repo
+already points at `letsencrypt-prod` — there is nothing to switch. Go the other way
+when you are re-installing repeatedly: temporarily point the `Certificate` at
+`letsencrypt-staging` and rename the `secretName` to `-staging` in the matching
+IngressRoute `tls` section, so you do not burn the Let's Encrypt rate limit.
 
 #### Security Benefits
 
@@ -1308,11 +1313,9 @@ The exports **must** use `sync` (verify with `exportfs -v` on the NFS server): w
 CrowdSec is deployed in the `crowdsec` namespace via the official Helm chart to watch Traefik logs (microk8s containerd). It auto-generates the registration token, stores data on the `microk8s-hostpath-retain` storage class, and exposes Prometheus ServiceMonitors.
 
 #### Features
-- Log acquisitions:
-  - Traefik pods (`traefik-*`) for HTTP scenarios
-  - Host `/var/log/auth.log` (mounted at `/var/log/host/auth.log` on the agent DaemonSet) for SSH brute-force scenarios
-- Base collections: `crowdsecurity/traefik` `crowdsecurity/linux` `crowdsecurity/http-cve` `crowdsecurity/base-http-scenarios` `crowdsecurity/sshd` `crowdsecurity/whitelists`
-- Custom whitelist (`s02-enrich/custom-whitelists.yaml`): Tailscale CGNAT (`100.64.0.0/10`), on top of the RFC1918 whitelist shipped by `crowdsecurity/whitelists`
+- Log acquisitions: Traefik pods (`traefik-*`) for HTTP scenarios. That is the only acquisition configured (`crowdsec.yml`) — there is no host `/var/log/auth.log` acquisition, and `templates/acquis.yaml.j2` is currently unused.
+- Base collections (`COLLECTIONS` env in `crowdsec.yml`): `crowdsecurity/traefik` `crowdsecurity/linux` `crowdsecurity/http-cve` `crowdsecurity/base-http-scenarios`. `crowdsecurity/whitelists` is not listed explicitly; it arrives as a dependency of `crowdsecurity/linux`.
+- Whitelists: only the RFC1918 whitelist that ships with `crowdsecurity/linux`. There is **no** custom whitelist parser in this repo, so the Tailscale CGNAT range (`100.64.0.0/10`) is not whitelisted in CrowdSec — add an `s02-enrich` parser override if you need it.
 - Auto-registration enabled for agents; no external DB
 - Metrics: ServiceMonitors enabled for LAPI, agent, and firewall bouncer (port 60601)
 - Bouncers: Traefik plugin (HTTP) + firewall bouncer DaemonSet (nftables L3/L4 on every node, `hostNetwork: true`)
@@ -1420,11 +1423,15 @@ microk8s kubectl cluster-info dump | grep service-cluster-ip-range
 
 ### 4. Approve subnet routes
 
-After deploy, in **admin console → Machines → vps-subnet-router → Edit route settings**, tick all advertised routes and click **Save**. Until approved, traffic to those subnets via the tailnet does not flow.
+After deploy, in **admin console → Machines**, find the machine named by `tailscale.hostname` (the code default is `vps-subnet-router`) → **Edit route settings**, tick all advertised routes and click **Save**. Until approved, traffic to those subnets via the tailnet does not flow.
 
 ### 5. Enable MagicDNS
 
 **admin console → DNS → MagicDNS: ON**.
+
+### 6. Add split-DNS for the private domain
+
+MagicDNS alone does not resolve `*.{{ network.private_domain }}` — those names live in the cluster's own CoreDNS. In **admin console → DNS → Nameservers**, add `192.168.1.220` and tick **Restrict to domain**, entering `lan`. Without this the network path works but you have to type IPs.
 
 ### Access
 
@@ -1639,8 +1646,8 @@ ansible-playbook -i hosts deploy.yml
 
 # 6) Tailscale: the operator created a new Connector with a fresh machine
 #    identity. Open the Tailscale admin console:
-#    Machines → vps-subnet-router → Edit route settings → re-approve everything.
-#    The old "vps-subnet-router" node stays offline; delete it manually.
+#    Machines → the host named by tailscale.hostname → Edit route settings →
+#    re-approve everything. The old node stays offline; delete it manually.
 ```
 
 > ℹ️ **Velero ↔ Ansible conflict**: a Velero restore re-creates Deployments + Helm release Secrets. Re-run the playbook afterwards to reconverge Ansible-managed resources.
